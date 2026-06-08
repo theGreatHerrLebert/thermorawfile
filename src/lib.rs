@@ -115,6 +115,18 @@ impl Profile {
     pub fn point_count(&self) -> usize {
         self.chunks.iter().map(|c| c.signal.len()).sum()
     }
+
+    /// m/z of a grid bin under `calib`.
+    pub fn mz_of_bin(&self, bin: u32, calib: &Calibration) -> f64 {
+        calib.mz(self.first_value + bin as f64 * self.step)
+    }
+
+    /// Nearest grid bin for a target m/z under `calib` (rounded), or `None` if
+    /// the m/z is unreachable.
+    pub fn bin_of_mz(&self, mz: f64, calib: &Calibration) -> Option<i64> {
+        let f = calib.freq(mz)?;
+        Some(((f - self.first_value) / self.step).round() as i64)
+    }
 }
 
 /// One contiguous run of profile signal points starting at `first_bin`.
@@ -123,6 +135,59 @@ pub struct ProfileChunk {
     pub first_bin: u32,
     pub fudge: f32,
     pub signal: Vec<f32>,
+}
+
+/// Per-scan frequency↔m/z calibration for an FTMS profile.
+///
+/// The profile is sampled on a uniform frequency grid (`f = first_value +
+/// bin·step`, from [`Profile`]); this maps frequency to m/z. Two forms exist,
+/// keyed by `nparam` (decoded against the RawFileReader oracle on rev66):
+/// `nparam == 4` → `m/z = a + b/f + c/f²`; `nparam ∈ {5, 7}` →
+/// `m/z = a + b/f² + c/f⁴`. The inverse (m/z→frequency) is what lets a writer
+/// place a peak at an arbitrary m/z onto the grid.
+#[derive(Clone, Copy, Debug)]
+pub struct Calibration {
+    pub nparam: u32,
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+}
+
+impl Calibration {
+    /// Frequency-grid value → m/z.
+    pub fn mz(&self, f: f64) -> f64 {
+        match self.nparam {
+            4 => self.a + self.b / f + self.c / (f * f),
+            _ => self.a + self.b / (f * f) + self.c / (f * f * f * f),
+        }
+    }
+
+    /// m/z → frequency-grid value (inverse of [`Calibration::mz`]). Returns
+    /// `None` if the target is unreachable (negative discriminant).
+    pub fn freq(&self, mz: f64) -> Option<f64> {
+        match self.nparam {
+            4 => {
+                // c·x² + b·x + (a − mz) = 0, x = 1/f
+                let (a, b, c) = (self.a - mz, self.b, self.c);
+                let disc = b * b - 4.0 * c * a;
+                if disc < 0.0 {
+                    return None;
+                }
+                let x = (-b + disc.sqrt()) / (2.0 * c);
+                (x != 0.0).then(|| 1.0 / x)
+            }
+            _ => {
+                // c·x² + b·x + (a − mz) = 0, x = 1/f²
+                let (a, b, c) = (self.a - mz, self.b, self.c);
+                let disc = b * b - 4.0 * c * a;
+                if disc < 0.0 {
+                    return None;
+                }
+                let x = (-b + disc.sqrt()) / (2.0 * c);
+                (x > 0.0).then(|| 1.0 / x.sqrt())
+            }
+        }
+    }
 }
 
 struct MsRunHeader {
@@ -377,6 +442,32 @@ impl RawFile {
             step,
             nbins,
             chunks,
+        })
+    }
+
+    /// Read the FTMS frequency↔m/z calibration from a scan-event byte offset.
+    ///
+    /// rev66 MS1 scan-event layout (decoded against the RawFileReader oracle):
+    /// `Nparam u32 @ +216`, then `A/B/C f64 @ +236 / +244 / +252`. Returns
+    /// `None` if `nparam` is not a recognised value (4/5/7) — e.g. a non-MS1
+    /// event. Locating the event offset for an arbitrary scan needs the
+    /// variable-length scan-event walk (MS1 events are longer than MS2); for
+    /// the first scan the offset is `scantrailer_addr + 4`.
+    pub fn calibration_at_event(&self, event_offset: usize) -> Option<Calibration> {
+        let o = event_offset;
+        if o + 260 > self.bytes.len() {
+            return None;
+        }
+        let nparam = u32::from_le_bytes(self.bytes[o + 216..o + 220].try_into().unwrap());
+        if !matches!(nparam, 4 | 5 | 7) {
+            return None;
+        }
+        let rd = |k: usize| f64::from_le_bytes(self.bytes[o + k..o + k + 8].try_into().unwrap());
+        Some(Calibration {
+            nparam,
+            a: rd(236),
+            b: rd(244),
+            c: rd(252),
         })
     }
 
