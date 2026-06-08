@@ -901,6 +901,252 @@ impl RawFile {
         Ok(())
     }
 
+    /// Overlay simulated peaks onto a scan's **existing** FTMS profile (real⊕sim).
+    ///
+    /// Reads the real profile, adds each simulated peak's intensity at its exact
+    /// grid bin (summing where a sim peak lands on an occupied bin), rebuilds the
+    /// profile as contiguous chunks, and rewrites within the packet budget
+    /// (offset + DataPacketSize unchanged, slack zeroed). The real analyte+noise
+    /// signal is **retained**, so a peptide the simulation also generates can
+    /// appear twice — this is real+sim, not a noise-only background.
+    pub fn overlay_profile(
+        &mut self,
+        scan: u32,
+        sim_peaks: &[(f64, f32)],
+        calib: &Calibration,
+    ) -> io::Result<()> {
+        if scan < self.first_scan || scan > self.last_scan {
+            return Err(err("scan out of range"));
+        }
+        let idx = (scan - self.first_scan) as usize;
+        let entry = self.index[idx].clone();
+        let pkt = (self.data_addr + entry.offset) as usize;
+        let old_len = entry.data_packet_size as usize;
+        if pkt.checked_add(old_len).map_or(true, |e| e > self.bytes.len()) {
+            return Err(err("packet extends past end of file"));
+        }
+        if idx + 1 < self.index.len() {
+            let next = (self.data_addr + self.index[idx + 1].offset) as usize;
+            if next < pkt || next - pkt < old_len {
+                return Err(err("packet would overrun the next scan's data"));
+            }
+        }
+
+        let prof = self
+            .profile(scan)
+            .ok_or_else(|| err("scan has no FTMS profile"))?;
+        let (first_value, step, nbins) = (prof.first_value, prof.step, prof.nbins);
+        if step == 0.0 || !step.is_finite() || !first_value.is_finite() {
+            return Err(err("profile grid is degenerate"));
+        }
+        let layout = u32::from_le_bytes(self.bytes[pkt + 12..pkt + 16].try_into().unwrap());
+        let unknown1 = u32::from_le_bytes(self.bytes[pkt..pkt + 4].try_into().unwrap());
+        // Native centroid width from the original peaklist.
+        let orig_profile_words =
+            u32::from_le_bytes(self.bytes[pkt + 4..pkt + 8].try_into().unwrap()) as usize;
+        let orig_peaklist_words =
+            u32::from_le_bytes(self.bytes[pkt + 8..pkt + 12].try_into().unwrap());
+        let pl_off = pkt + 40 + orig_profile_words * 4;
+        let centroid_wide = if orig_peaklist_words > 0 && pl_off + 4 <= self.bytes.len() {
+            let cnt = u32::from_le_bytes(self.bytes[pl_off..pl_off + 4].try_into().unwrap());
+            peak_is_wide(orig_peaklist_words, cnt)
+        } else {
+            true
+        };
+
+        // Accumulate the real signal per bin, then add the simulated peaks.
+        use std::collections::BTreeMap;
+        let mut acc: BTreeMap<u32, f32> = BTreeMap::new();
+        for ch in &prof.chunks {
+            for (j, &v) in ch.signal.iter().enumerate() {
+                *acc.entry(ch.first_bin + j as u32).or_insert(0.0) += v;
+            }
+        }
+        for &(mz, inten) in sim_peaks {
+            let f = calib
+                .freq(mz)
+                .ok_or_else(|| err("sim peak m/z unreachable by this calibration"))?;
+            let b = ((f - first_value) / step).round();
+            if !b.is_finite() || b < 0.0 || b >= nbins as f64 {
+                return Err(err("sim peak m/z falls outside the scan's frequency grid"));
+            }
+            *acc.entry(b as u32).or_insert(0.0) += inten;
+        }
+
+        // Build contiguous chunks from the sorted (bin, value) map.
+        struct Ck {
+            first_bin: u32,
+            signal: Vec<f32>,
+        }
+        let mut chunks: Vec<Ck> = Vec::new();
+        for (bin, v) in acc {
+            match chunks.last_mut() {
+                Some(c) if c.first_bin + c.signal.len() as u32 == bin => c.signal.push(v),
+                _ => chunks.push(Ck {
+                    first_bin: bin,
+                    signal: vec![v],
+                }),
+            }
+        }
+        let num_chunks = chunks.len();
+        if num_chunks > u16::MAX as usize {
+            return Err(err("too many profile chunks (max 65535)"));
+        }
+
+        let chunk_hdr = if layout > 0 { 12usize } else { 8 };
+        let centroid_bytes = if centroid_wide { 12usize } else { 8 };
+        let total_points: usize = chunks.iter().map(|c| c.signal.len()).sum();
+        let profile_bytes = 16 + 8 + num_chunks * chunk_hdr + total_points * 4;
+        let peaklist_bytes = 4 + num_chunks * centroid_bytes;
+        let descriptor_bytes = num_chunks * 4;
+        let new_len = 40 + profile_bytes + peaklist_bytes + descriptor_bytes;
+        if new_len > old_len {
+            return Err(err("overlaid profile exceeds the scan's packet budget"));
+        }
+        let profile_words =
+            u32::try_from(profile_bytes / 4).map_err(|_| err("profile too large"))?;
+        let peaklist_words =
+            u32::try_from(peaklist_bytes / 4).map_err(|_| err("peaklist too large"))?;
+        let nc = num_chunks as u32;
+
+        // Stats over all points; per-chunk apex centroid for the peaklist.
+        let mut tic = 0f64;
+        let mut base_int = 0f64;
+        let mut base_mz = 0f64;
+        let mut low_mz = f64::INFINITY;
+        let mut high_mz = f64::NEG_INFINITY;
+        let mut centroids: Vec<(f64, f32)> = Vec::with_capacity(num_chunks);
+        for c in &chunks {
+            let (mut apex_v, mut apex_bin) = (f32::NEG_INFINITY, c.first_bin);
+            for (j, &v) in c.signal.iter().enumerate() {
+                tic += v as f64;
+                let bin = c.first_bin + j as u32;
+                let mz = calib.mz(first_value + bin as f64 * step);
+                low_mz = low_mz.min(mz);
+                high_mz = high_mz.max(mz);
+                if v as f64 > base_int {
+                    base_int = v as f64;
+                    base_mz = mz;
+                }
+                if v > apex_v {
+                    apex_v = v;
+                    apex_bin = bin;
+                }
+            }
+            centroids.push((calib.mz(first_value + apex_bin as f64 * step), apex_v));
+        }
+        if chunks.is_empty() {
+            low_mz = 0.0;
+            high_mz = 0.0;
+        }
+
+        // Header.
+        put_u32(&mut self.bytes, pkt, unknown1);
+        put_u32(&mut self.bytes, pkt + 4, profile_words);
+        put_u32(&mut self.bytes, pkt + 8, peaklist_words);
+        put_u32(&mut self.bytes, pkt + 12, layout);
+        put_u32(&mut self.bytes, pkt + 16, nc);
+        put_u32(&mut self.bytes, pkt + 20, 0);
+        put_u32(&mut self.bytes, pkt + 24, 0);
+        put_u32(&mut self.bytes, pkt + 28, 0);
+        put_f32(&mut self.bytes, pkt + 32, low_mz as f32);
+        put_f32(&mut self.bytes, pkt + 36, high_mz as f32);
+        // Profile.
+        let mut o = pkt + 40;
+        put_f64(&mut self.bytes, o, first_value);
+        put_f64(&mut self.bytes, o + 8, step);
+        put_u32(&mut self.bytes, o + 16, nc);
+        put_u32(&mut self.bytes, o + 20, nbins);
+        o += 24;
+        for c in &chunks {
+            put_u32(&mut self.bytes, o, c.first_bin);
+            put_u32(&mut self.bytes, o + 4, c.signal.len() as u32);
+            o += 8;
+            if layout > 0 {
+                put_f32(&mut self.bytes, o, 0.0);
+                o += 4;
+            }
+            for &v in &c.signal {
+                put_f32(&mut self.bytes, o, v);
+                o += 4;
+            }
+        }
+        // Centroid peaklist (per-chunk apex).
+        put_u32(&mut self.bytes, o, nc);
+        o += 4;
+        for &(mz, inten) in &centroids {
+            if centroid_wide {
+                put_f64(&mut self.bytes, o, mz);
+                put_f32(&mut self.bytes, o + 8, inten);
+            } else {
+                put_f32(&mut self.bytes, o, mz as f32);
+                put_f32(&mut self.bytes, o + 4, inten);
+            }
+            o += centroid_bytes;
+        }
+        // Descriptors.
+        for i in 0..num_chunks {
+            self.bytes[o..o + 2].copy_from_slice(&(i as u16).to_le_bytes());
+            self.bytes[o + 2] = 0;
+            self.bytes[o + 3] = 0;
+            o += 4;
+        }
+        debug_assert_eq!(o, pkt + new_len);
+        for b in &mut self.bytes[pkt + new_len..pkt + old_len] {
+            *b = 0;
+        }
+        let ea = self.scan_index_addr as usize + idx * scan_index_entry_size(self.version);
+        put_f64(&mut self.bytes, ea + 32, tic);
+        put_f64(&mut self.bytes, ea + 40, base_int);
+        put_f64(&mut self.bytes, ea + 48, base_mz);
+        put_f64(&mut self.bytes, ea + 56, low_mz);
+        put_f64(&mut self.bytes, ea + 64, high_mz);
+        self.index[idx] = ScanIndexEntry {
+            total_current: tic,
+            base_mz,
+            low_mz,
+            high_mz,
+            ..entry
+        };
+        Ok(())
+    }
+
+    /// Overlay simulated centroids onto a scan's **existing** centroid list
+    /// (real⊕sim for ASTMS MS2). Merges the real peaks with `sim_peaks`, combining
+    /// any within `merge_tol_ppm` (intensity-weighted m/z, summed intensity), and
+    /// rewrites via [`RawFile::author_centroids`]. Real signal is retained.
+    pub fn overlay_centroids(
+        &mut self,
+        scan: u32,
+        sim_peaks: &[(f64, f32)],
+        merge_tol_ppm: f64,
+    ) -> io::Result<()> {
+        let mut all: Vec<(f64, f32)> = self
+            .centroid_peaks(scan)
+            .iter()
+            .map(|p| (p.mz, p.intensity))
+            .collect();
+        all.extend_from_slice(sim_peaks);
+        all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Merge neighbours within tolerance: intensity-weighted m/z, summed int.
+        let mut merged: Vec<(f64, f32)> = Vec::with_capacity(all.len());
+        for (mz, inten) in all {
+            match merged.last_mut() {
+                Some((pmz, pint))
+                    if (mz - *pmz).abs() / mz * 1.0e6 <= merge_tol_ppm =>
+                {
+                    let w = *pint as f64 + inten as f64;
+                    if w > 0.0 {
+                        *pmz = (*pmz * *pint as f64 + mz * inten as f64) / w;
+                    }
+                    *pint += inten;
+                }
+                _ => merged.push((mz, inten)),
+            }
+        }
+        self.author_centroids(scan, &merged)
+    }
+
     /// Author a *new* centroid-only spectrum of arbitrary peak count into `scan`
     /// (e.g. an Astral ASTMS MS2 scan), writing the peaks directly — centroids
     /// store m/z, so no calibration is needed.
