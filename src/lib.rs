@@ -97,6 +97,27 @@ struct MsRunHeader {
     scan_index_addr: u64,
     data_addr: u64,
     scantrailer_addr: u64,
+    scanparams_addr: u64,
+}
+
+// Scan-event field offsets within a fixed-size event record (rev 66), decoded
+// empirically against RawFileReader (unthermo's variable-length v66 layout is
+// wrong). Events are a contiguous fixed-stride array in [scantrailer+4, scanparams).
+const EV_MS_ORDER: usize = 6; // preamble: 1 = MS1, 2 = MS2
+const EV_ANALYZER: usize = 40; // 0 = ITMS, 4 = FTMS
+const EV_ISO_CENTER: usize = 140; // f64 precursor / isolation-window center m/z
+const EV_ISO_WIDTH: usize = 148; // f64 isolation width
+const EV_COLLISION_ENERGY: usize = 156; // f64 collision energy
+
+/// The acquisition descriptor for one scan: MS order, analyzer, and (for MS2)
+/// the quadrupole isolation window + collision energy.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanEvent {
+    pub ms_order: u8,
+    pub analyzer: u8,
+    pub isolation_center: f64,
+    pub isolation_width: f64,
+    pub collision_energy: f64,
 }
 
 /// A parsed Thermo `.raw` file held entirely in memory.
@@ -107,6 +128,10 @@ pub struct RawFile {
     pub last_scan: u32,
     pub scan_index_addr: u64,
     pub data_addr: u64,
+    pub scantrailer_addr: u64,
+    pub scanparams_addr: u64,
+    /// Fixed stride of a scan-event record (bytes); 0 if it could not be derived.
+    pub scan_event_size: usize,
     pub index: Vec<ScanIndexEntry>,
 }
 
@@ -202,6 +227,14 @@ impl RawFile {
             });
         }
 
+        // Scan events are a fixed-stride array in [scantrailer+4, scanparams).
+        let region = (ms.scanparams_addr).saturating_sub(ms.scantrailer_addr + 4) as usize;
+        let scan_event_size = if n > 0 && region >= n && region % n == 0 {
+            region / n
+        } else {
+            0
+        };
+
         Ok(RawFile {
             bytes,
             version,
@@ -209,6 +242,9 @@ impl RawFile {
             last_scan: ms.last_scan,
             scan_index_addr: ms.scan_index_addr,
             data_addr: ms.data_addr,
+            scantrailer_addr: ms.scantrailer_addr,
+            scanparams_addr: ms.scanparams_addr,
+            scan_event_size,
             index,
         })
     }
@@ -362,6 +398,49 @@ impl RawFile {
         self.recompute_checksum();
         std::fs::write(path, &self.bytes)
     }
+
+    fn scan_event_offset(&self, scan: u32) -> Option<usize> {
+        if self.scan_event_size == 0 || scan < self.first_scan || scan > self.last_scan {
+            return None;
+        }
+        Some(
+            self.scantrailer_addr as usize
+                + 4
+                + (scan - self.first_scan) as usize * self.scan_event_size,
+        )
+    }
+
+    /// Read the acquisition descriptor (MS order, analyzer, isolation, CE) for `scan`.
+    pub fn scan_event(&self, scan: u32) -> Option<ScanEvent> {
+        let o = self.scan_event_offset(scan)?;
+        let f64at = |off: usize| f64::from_le_bytes(self.bytes[off..off + 8].try_into().unwrap());
+        Some(ScanEvent {
+            ms_order: self.bytes[o + EV_MS_ORDER],
+            analyzer: self.bytes[o + EV_ANALYZER],
+            isolation_center: f64at(o + EV_ISO_CENTER),
+            isolation_width: f64at(o + EV_ISO_WIDTH),
+            collision_energy: f64at(o + EV_COLLISION_ENERGY),
+        })
+    }
+
+    /// Author an MS2 isolation window: set the precursor / window-center m/z,
+    /// isolation width, and collision energy for `scan`. Call [`RawFile::save`]
+    /// afterwards to fix the checksum.
+    pub fn set_isolation(
+        &mut self,
+        scan: u32,
+        center: f64,
+        width: f64,
+        collision_energy: f64,
+    ) -> io::Result<()> {
+        let o = self
+            .scan_event_offset(scan)
+            .ok_or_else(|| err("no scan event (unknown event stride or scan out of range)"))?;
+        put_f64(&mut self.bytes, o + EV_ISO_CENTER, center);
+        put_f64(&mut self.bytes, o + EV_ISO_WIDTH, width);
+        put_f64(&mut self.bytes, o + EV_COLLISION_ENERGY, collision_energy);
+        Ok(())
+    }
 }
 
 fn read_version(b: &[u8]) -> u32 {
@@ -385,12 +464,14 @@ fn read_runheader(b: &[u8], addr: usize) -> MsRunHeader {
     c.u64(); // ErrorlogAddr
     c.u64(); // Unknown9
     let scantrailer_addr = c.u64();
+    let scanparams_addr = c.u64();
     MsRunHeader {
         first_scan,
         last_scan,
         scan_index_addr,
         data_addr,
         scantrailer_addr,
+        scanparams_addr,
     }
 }
 
