@@ -1,0 +1,14 @@
+thermorawfile
+Copyright 2026 David Teschner
+
+This product includes binary-format layout knowledge derived from the "unthermo"
+project (https://bitbucket.org/proteinspector/ms), Copyright Pieter Kelchtermans,
+licensed under the Apache License, Version 2.0.
+
+Sample .raw files under tests/data/ are taken from the ThermoRawFileParser project
+(https://github.com/compomics/ThermoRawFileParser), licensed under the Apache
+License, Version 2.0, and are used here as read-only test fixtures.
+
+The Thermo Finnigan .raw format is the property of Thermo Fisher Scientific. This
+project is an independent, clean-room implementation and is not affiliated with or
+endorsed by Thermo Fisher Scientific.
