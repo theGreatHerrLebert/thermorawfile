@@ -163,30 +163,55 @@ impl Calibration {
     }
 
     /// m/z → frequency-grid value (inverse of [`Calibration::mz`]). Returns
-    /// `None` if the target is unreachable (negative discriminant).
+    /// `None` if the target is unreachable: non-finite inputs, no real root, or
+    /// no root yielding a positive, finite frequency.
+    ///
+    /// Solves `c·x² + b·x + (a − mz) = 0` where `x = 1/f` (nparam 4) or
+    /// `x = 1/f²` (nparam 5/7), handling the degenerate linear case (`c == 0`),
+    /// and selecting — among the candidate roots — the positive-frequency one
+    /// that maps back closest to the requested m/z.
     pub fn freq(&self, mz: f64) -> Option<f64> {
-        match self.nparam {
-            4 => {
-                // c·x² + b·x + (a − mz) = 0, x = 1/f
-                let (a, b, c) = (self.a - mz, self.b, self.c);
-                let disc = b * b - 4.0 * c * a;
-                if disc < 0.0 {
-                    return None;
-                }
-                let x = (-b + disc.sqrt()) / (2.0 * c);
-                (x != 0.0).then(|| 1.0 / x)
+        if ![mz, self.a, self.b, self.c].iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let d = self.a - mz; // c·x² + b·x + d = 0
+        let xs: [Option<f64>; 2] = if self.c == 0.0 {
+            // Linear: b·x + d = 0.
+            if self.b == 0.0 {
+                return None;
             }
-            _ => {
-                // c·x² + b·x + (a − mz) = 0, x = 1/f²
-                let (a, b, c) = (self.a - mz, self.b, self.c);
-                let disc = b * b - 4.0 * c * a;
-                if disc < 0.0 {
-                    return None;
-                }
-                let x = (-b + disc.sqrt()) / (2.0 * c);
-                (x > 0.0).then(|| 1.0 / x.sqrt())
+            [Some(-d / self.b), None]
+        } else {
+            let disc = self.b * self.b - 4.0 * self.c * d;
+            if disc < 0.0 {
+                return None;
+            }
+            let s = disc.sqrt();
+            [
+                Some((-self.b + s) / (2.0 * self.c)),
+                Some((-self.b - s) / (2.0 * self.c)),
+            ]
+        };
+        let mut best: Option<f64> = None;
+        let mut best_err = f64::INFINITY;
+        for x in xs.into_iter().flatten() {
+            if !x.is_finite() || x <= 0.0 {
+                continue; // need positive frequency
+            }
+            let f = match self.nparam {
+                4 => 1.0 / x,
+                _ => 1.0 / x.sqrt(),
+            };
+            if !f.is_finite() || f <= 0.0 {
+                continue;
+            }
+            let err = (self.mz(f) - mz).abs();
+            if err < best_err {
+                best_err = err;
+                best = Some(f);
             }
         }
+        best
     }
 }
 
@@ -522,7 +547,6 @@ impl RawFile {
         if profile_size != 0 || peaklist_size == 0 {
             return Err(err("not a centroid-only scan (profile rewrite is TODO)"));
         }
-        let peaklist_size = u32::from_le_bytes(self.bytes[pkt + 8..pkt + 12].try_into().unwrap());
         let count = u32::from_le_bytes(self.bytes[pkt + 40..pkt + 44].try_into().unwrap()) as usize;
         if peaks.len() != count {
             return Err(err(
@@ -532,7 +556,17 @@ impl RawFile {
 
         // Peak record width is analyzer-dependent: 12 bytes { f64 m/z, f32 int }
         // for FTMS, 8 bytes { f32 m/z, f32 int } for the Astral analyzer (ASTMS).
-        let wide = peak_is_wide(peaklist_size, count as u32);
+        // Require an EXACT words-per-peak (2 or 3) before mutating — a malformed
+        // size must not silently mis-stride and overwrite past the peaklist.
+        if count == 0 {
+            return Err(err("empty peaklist"));
+        }
+        let body = (peaklist_size as usize).saturating_sub(1); // minus the u32 count word
+        let wide = match (body % count, body / count) {
+            (0, 3) => true,
+            (0, 2) => false,
+            _ => return Err(err("inconsistent peaklist_size / count (not 2 or 3 words/peak)")),
+        };
         let stride = if wide { 12 } else { 8 };
         let peaks_off = pkt + 44;
         let mut tic = 0f64;
@@ -663,15 +697,18 @@ impl RawFile {
     /// point count), this rebuilds the profile section with one single-bin chunk
     /// per peak — so the peak count is arbitrary. It stays within the scan's
     /// existing packet byte budget (a sparse synthetic spectrum is far smaller
-    /// than a real dense profile) and keeps every scan-index `offset` unchanged,
-    /// so no downstream offset/address rebuild is needed. The leftover packet
-    /// bytes become slack; `DataPacketSize` is set to the true new length. The
-    /// centroid label list is dropped (peaklist_size = 0). Recomputes the
-    /// scan-index stats (TIC, base peak m/z via `calib`, m/z range). Call
-    /// [`RawFile::save`] to fix the checksum.
+    /// than a real dense profile) and keeps both the scan-index `offset` *and*
+    /// `DataPacketSize` unchanged — the rebuilt sections are bounded by their own
+    /// size fields and the leftover bytes are zeroed slack inside the packet, so
+    /// neither index-based nor sequential packet walking is disturbed and no
+    /// downstream offset/address rebuild is needed. Emits a coherent profile +
+    /// centroid peaklist + peak-descriptor list (all length K); the centroid
+    /// record width matches the scan's native width. Recomputes the scan-index
+    /// stats (TIC, base peak m/z via `calib`, m/z range). Call [`RawFile::save`]
+    /// to fix the checksum.
     ///
-    /// Errors if the scan has no profile, a peak is unreachable by `calib`, or
-    /// the new packet would exceed the existing one.
+    /// Errors if the scan has no profile, a peak is unreachable by `calib`, the
+    /// new packet would exceed the existing one, or the packet is malformed.
     pub fn author_profile(
         &mut self,
         scan: u32,
@@ -681,10 +718,25 @@ impl RawFile {
         if scan < self.first_scan || scan > self.last_scan {
             return Err(err("scan out of range"));
         }
+        if peaks.len() > u16::MAX as usize {
+            // Descriptor index is a u16; refuse counts that would wrap it.
+            return Err(err("too many peaks (max 65535 per authored profile)"));
+        }
         let idx = (scan - self.first_scan) as usize;
         let entry = self.index[idx].clone();
         let pkt = (self.data_addr + entry.offset) as usize;
         let old_len = entry.data_packet_size as usize;
+
+        // Validate the packet's byte span against actual storage + the next packet.
+        if pkt.checked_add(old_len).map_or(true, |e| e > self.bytes.len()) {
+            return Err(err("packet extends past end of file"));
+        }
+        if idx + 1 < self.index.len() {
+            let next = (self.data_addr + self.index[idx + 1].offset) as usize;
+            if next < pkt || next - pkt < old_len {
+                return Err(err("packet would overrun the next scan's data"));
+            }
+        }
 
         // Grid + layout come from the existing profile packet.
         let prof = self
@@ -692,6 +744,22 @@ impl RawFile {
             .ok_or_else(|| err("scan has no FTMS profile to take the grid from"))?;
         let layout = u32::from_le_bytes(self.bytes[pkt + 12..pkt + 16].try_into().unwrap());
         let (first_value, step, nbins) = (prof.first_value, prof.step, prof.nbins);
+        if step == 0.0 || !step.is_finite() || !first_value.is_finite() {
+            return Err(err("profile grid is degenerate (step/first_value not finite)"));
+        }
+
+        // Native centroid record width: read the original peaklist size + count.
+        let orig_profile_words =
+            u32::from_le_bytes(self.bytes[pkt + 4..pkt + 8].try_into().unwrap()) as usize;
+        let orig_peaklist_words =
+            u32::from_le_bytes(self.bytes[pkt + 8..pkt + 12].try_into().unwrap());
+        let pl_off = pkt + 40 + orig_profile_words * 4;
+        let centroid_wide = if orig_peaklist_words > 0 && pl_off + 4 <= self.bytes.len() {
+            let cnt = u32::from_le_bytes(self.bytes[pl_off..pl_off + 4].try_into().unwrap());
+            peak_is_wide(orig_peaklist_words, cnt)
+        } else {
+            true // default to the 12-byte FTMS form if no native peaklist
+        };
 
         // Map each peak to its exact grid bin; merge peaks landing on the same bin.
         let mut binned: Vec<(u32, f32)> = Vec::with_capacity(peaks.len());
@@ -700,7 +768,7 @@ impl RawFile {
                 .freq(mz)
                 .ok_or_else(|| err("peak m/z unreachable by this calibration"))?;
             let bin = ((f - first_value) / step).round();
-            if bin < 0.0 || bin >= nbins as f64 {
+            if !bin.is_finite() || bin < 0.0 || bin >= nbins as f64 {
                 return Err(err("peak m/z falls outside the scan's frequency grid"));
             }
             binned.push((bin as u32, inten));
@@ -720,16 +788,20 @@ impl RawFile {
         // peaklist + peak-descriptor list, all of length K (in the real file
         // peak_count == peaklist count == descriptor_list_size).
         let unknown1 = u32::from_le_bytes(self.bytes[pkt..pkt + 4].try_into().unwrap());
-        let chunk_bytes = if layout > 0 { 16 } else { 12 };
+        let chunk_bytes = if layout > 0 { 16usize } else { 12 };
+        let centroid_bytes = if centroid_wide { 12usize } else { 8 }; // {f64|f32 mz, f32 int}
+        // Sizes via checked arithmetic (k is already bounded to <= u16::MAX).
         let profile_bytes = 16 + 8 + k * chunk_bytes; // firstval+step + peakcount+nbins + chunks
-        let peaklist_bytes = 4 + k * 8; // count u32 + K * {f32 mz, f32 int}
+        let peaklist_bytes = 4 + k * centroid_bytes; // count u32 + K centroid records
         let descriptor_bytes = k * 4; // K * {u16 index, u8 flags, u8 charge}
         let new_len = 40 + profile_bytes + peaklist_bytes + descriptor_bytes;
         if new_len > old_len {
             return Err(err("authored profile exceeds the scan's packet budget"));
         }
-        let profile_words = (profile_bytes / 4) as u32;
-        let peaklist_words = (peaklist_bytes / 4) as u32;
+        let profile_words = u32::try_from(profile_bytes / 4).map_err(|_| err("profile too large"))?;
+        let peaklist_words =
+            u32::try_from(peaklist_bytes / 4).map_err(|_| err("peaklist too large"))?;
+        let k_u32 = k as u32; // k <= u16::MAX, fits u32
 
         // Stats over the authored peaks.
         let mut tic = 0f64;
@@ -757,7 +829,7 @@ impl RawFile {
         put_u32(&mut self.bytes, pkt + 4, profile_words); // profile_size (words)
         put_u32(&mut self.bytes, pkt + 8, peaklist_words); // peaklist_size (words)
         put_u32(&mut self.bytes, pkt + 12, layout); // layout (governs fudge)
-        put_u32(&mut self.bytes, pkt + 16, k as u32); // descriptor_list_size
+        put_u32(&mut self.bytes, pkt + 16, k_u32); // descriptor_list_size
         put_u32(&mut self.bytes, pkt + 20, 0); // unknown_stream_size
         put_u32(&mut self.bytes, pkt + 24, 0); // triplet_stream_size
         put_u32(&mut self.bytes, pkt + 28, 0); // unknown2
@@ -768,7 +840,7 @@ impl RawFile {
         let mut o = pkt + 40;
         put_f64(&mut self.bytes, o, first_value);
         put_f64(&mut self.bytes, o + 8, step);
-        put_u32(&mut self.bytes, o + 16, k as u32); // peak_count
+        put_u32(&mut self.bytes, o + 16, k_u32); // peak_count
         put_u32(&mut self.bytes, o + 20, nbins); // nbins (grid)
         o += 24;
         for &(bin, inten) in &chunks {
@@ -782,14 +854,19 @@ impl RawFile {
             put_f32(&mut self.bytes, o, inten);
             o += 4;
         }
-        // Centroid peaklist: count + {f32 m/z, f32 intensity} per peak.
-        put_u32(&mut self.bytes, o, k as u32);
+        // Centroid peaklist: count + native-width records ({f64|f32 m/z, f32 int}).
+        put_u32(&mut self.bytes, o, k_u32);
         o += 4;
         for &(bin, inten) in &chunks {
-            let mz = calib.mz(first_value + bin as f64 * step) as f32;
-            put_f32(&mut self.bytes, o, mz);
-            put_f32(&mut self.bytes, o + 4, inten);
-            o += 8;
+            let mz = calib.mz(first_value + bin as f64 * step);
+            if centroid_wide {
+                put_f64(&mut self.bytes, o, mz);
+                put_f32(&mut self.bytes, o + 8, inten);
+            } else {
+                put_f32(&mut self.bytes, o, mz as f32);
+                put_f32(&mut self.bytes, o + 4, inten);
+            }
+            o += centroid_bytes;
         }
         // Peak-descriptor list: {u16 index, u8 flags, u8 charge} per peak.
         for i in 0..k {
@@ -804,16 +881,17 @@ impl RawFile {
             *b = 0;
         }
 
-        // Update the scan-index entry: new packet size + stats; offset unchanged.
+        // Update the scan-index stats only. DataPacketSize AND offset are left
+        // unchanged: the rebuilt sections are bounded by their own size fields,
+        // the remaining bytes are zeroed slack inside the packet's original span,
+        // so both index-based and sequential packet walking stay valid.
         let ea = self.scan_index_addr as usize + idx * scan_index_entry_size(self.version);
-        put_u32(&mut self.bytes, ea + 20, new_len as u32); // DataPacketSize
         put_f64(&mut self.bytes, ea + 32, tic);
         put_f64(&mut self.bytes, ea + 40, base_int);
         put_f64(&mut self.bytes, ea + 48, base_mz);
         put_f64(&mut self.bytes, ea + 56, low_mz);
         put_f64(&mut self.bytes, ea + 64, high_mz);
         self.index[idx] = ScanIndexEntry {
-            data_packet_size: new_len as u32,
             total_current: tic,
             base_mz,
             low_mz,
