@@ -656,6 +656,173 @@ impl RawFile {
         Ok(())
     }
 
+    /// Author a *new* FTMS profile of arbitrary peak count into `scan`, placing
+    /// each `(m/z, intensity)` at its exact grid bin via `calib`.
+    ///
+    /// Unlike [`RawFile::set_profile_intensities`] (which keeps the existing
+    /// point count), this rebuilds the profile section with one single-bin chunk
+    /// per peak — so the peak count is arbitrary. It stays within the scan's
+    /// existing packet byte budget (a sparse synthetic spectrum is far smaller
+    /// than a real dense profile) and keeps every scan-index `offset` unchanged,
+    /// so no downstream offset/address rebuild is needed. The leftover packet
+    /// bytes become slack; `DataPacketSize` is set to the true new length. The
+    /// centroid label list is dropped (peaklist_size = 0). Recomputes the
+    /// scan-index stats (TIC, base peak m/z via `calib`, m/z range). Call
+    /// [`RawFile::save`] to fix the checksum.
+    ///
+    /// Errors if the scan has no profile, a peak is unreachable by `calib`, or
+    /// the new packet would exceed the existing one.
+    pub fn author_profile(
+        &mut self,
+        scan: u32,
+        peaks: &[(f64, f32)],
+        calib: &Calibration,
+    ) -> io::Result<()> {
+        if scan < self.first_scan || scan > self.last_scan {
+            return Err(err("scan out of range"));
+        }
+        let idx = (scan - self.first_scan) as usize;
+        let entry = self.index[idx].clone();
+        let pkt = (self.data_addr + entry.offset) as usize;
+        let old_len = entry.data_packet_size as usize;
+
+        // Grid + layout come from the existing profile packet.
+        let prof = self
+            .profile(scan)
+            .ok_or_else(|| err("scan has no FTMS profile to take the grid from"))?;
+        let layout = u32::from_le_bytes(self.bytes[pkt + 12..pkt + 16].try_into().unwrap());
+        let (first_value, step, nbins) = (prof.first_value, prof.step, prof.nbins);
+
+        // Map each peak to its exact grid bin; merge peaks landing on the same bin.
+        let mut binned: Vec<(u32, f32)> = Vec::with_capacity(peaks.len());
+        for &(mz, inten) in peaks {
+            let f = calib
+                .freq(mz)
+                .ok_or_else(|| err("peak m/z unreachable by this calibration"))?;
+            let bin = ((f - first_value) / step).round();
+            if bin < 0.0 || bin >= nbins as f64 {
+                return Err(err("peak m/z falls outside the scan's frequency grid"));
+            }
+            binned.push((bin as u32, inten));
+        }
+        binned.sort_by_key(|x| x.0);
+        let mut chunks: Vec<(u32, f32)> = Vec::with_capacity(binned.len());
+        for (bin, inten) in binned {
+            match chunks.last_mut() {
+                Some(last) if last.0 == bin => last.1 += inten,
+                _ => chunks.push((bin, inten)),
+            }
+        }
+
+        let k = chunks.len();
+        // Mirror the original packet structure so RawFileReader decodes it: a
+        // profile (one single-bin chunk per peak) AND a coherent centroid
+        // peaklist + peak-descriptor list, all of length K (in the real file
+        // peak_count == peaklist count == descriptor_list_size).
+        let unknown1 = u32::from_le_bytes(self.bytes[pkt..pkt + 4].try_into().unwrap());
+        let chunk_bytes = if layout > 0 { 16 } else { 12 };
+        let profile_bytes = 16 + 8 + k * chunk_bytes; // firstval+step + peakcount+nbins + chunks
+        let peaklist_bytes = 4 + k * 8; // count u32 + K * {f32 mz, f32 int}
+        let descriptor_bytes = k * 4; // K * {u16 index, u8 flags, u8 charge}
+        let new_len = 40 + profile_bytes + peaklist_bytes + descriptor_bytes;
+        if new_len > old_len {
+            return Err(err("authored profile exceeds the scan's packet budget"));
+        }
+        let profile_words = (profile_bytes / 4) as u32;
+        let peaklist_words = (peaklist_bytes / 4) as u32;
+
+        // Stats over the authored peaks.
+        let mut tic = 0f64;
+        let mut base_int = 0f64;
+        let mut base_mz = 0f64;
+        let mut low_mz = f64::INFINITY;
+        let mut high_mz = f64::NEG_INFINITY;
+        for &(bin, inten) in &chunks {
+            let mz = calib.mz(first_value + bin as f64 * step);
+            tic += inten as f64;
+            if inten as f64 > base_int {
+                base_int = inten as f64;
+                base_mz = mz;
+            }
+            low_mz = low_mz.min(mz);
+            high_mz = high_mz.max(mz);
+        }
+        if chunks.is_empty() {
+            low_mz = 0.0;
+            high_mz = 0.0;
+        }
+
+        // Write the header (preserve unknown1; peak_count == peaklist == descriptors == K).
+        put_u32(&mut self.bytes, pkt, unknown1);
+        put_u32(&mut self.bytes, pkt + 4, profile_words); // profile_size (words)
+        put_u32(&mut self.bytes, pkt + 8, peaklist_words); // peaklist_size (words)
+        put_u32(&mut self.bytes, pkt + 12, layout); // layout (governs fudge)
+        put_u32(&mut self.bytes, pkt + 16, k as u32); // descriptor_list_size
+        put_u32(&mut self.bytes, pkt + 20, 0); // unknown_stream_size
+        put_u32(&mut self.bytes, pkt + 24, 0); // triplet_stream_size
+        put_u32(&mut self.bytes, pkt + 28, 0); // unknown2
+        put_f32(&mut self.bytes, pkt + 32, low_mz as f32);
+        put_f32(&mut self.bytes, pkt + 36, high_mz as f32);
+
+        // Write the profile (one single-bin chunk per peak).
+        let mut o = pkt + 40;
+        put_f64(&mut self.bytes, o, first_value);
+        put_f64(&mut self.bytes, o + 8, step);
+        put_u32(&mut self.bytes, o + 16, k as u32); // peak_count
+        put_u32(&mut self.bytes, o + 20, nbins); // nbins (grid)
+        o += 24;
+        for &(bin, inten) in &chunks {
+            put_u32(&mut self.bytes, o, bin);
+            put_u32(&mut self.bytes, o + 4, 1); // nbins in chunk
+            o += 8;
+            if layout > 0 {
+                put_f32(&mut self.bytes, o, 0.0); // fudge
+                o += 4;
+            }
+            put_f32(&mut self.bytes, o, inten);
+            o += 4;
+        }
+        // Centroid peaklist: count + {f32 m/z, f32 intensity} per peak.
+        put_u32(&mut self.bytes, o, k as u32);
+        o += 4;
+        for &(bin, inten) in &chunks {
+            let mz = calib.mz(first_value + bin as f64 * step) as f32;
+            put_f32(&mut self.bytes, o, mz);
+            put_f32(&mut self.bytes, o + 4, inten);
+            o += 8;
+        }
+        // Peak-descriptor list: {u16 index, u8 flags, u8 charge} per peak.
+        for i in 0..k {
+            self.bytes[o..o + 2].copy_from_slice(&(i as u16).to_le_bytes());
+            self.bytes[o + 2] = 0; // flags
+            self.bytes[o + 3] = 0; // charge
+            o += 4;
+        }
+        debug_assert_eq!(o, pkt + new_len);
+        // Zero the slack up to the old packet end.
+        for b in &mut self.bytes[pkt + new_len..pkt + old_len] {
+            *b = 0;
+        }
+
+        // Update the scan-index entry: new packet size + stats; offset unchanged.
+        let ea = self.scan_index_addr as usize + idx * scan_index_entry_size(self.version);
+        put_u32(&mut self.bytes, ea + 20, new_len as u32); // DataPacketSize
+        put_f64(&mut self.bytes, ea + 32, tic);
+        put_f64(&mut self.bytes, ea + 40, base_int);
+        put_f64(&mut self.bytes, ea + 48, base_mz);
+        put_f64(&mut self.bytes, ea + 56, low_mz);
+        put_f64(&mut self.bytes, ea + 64, high_mz);
+        self.index[idx] = ScanIndexEntry {
+            data_packet_size: new_len as u32,
+            total_current: tic,
+            base_mz,
+            low_mz,
+            high_mz,
+            ..entry
+        };
+        Ok(())
+    }
+
     /// Recompute and write the Adler-32 integrity checksum into the header.
     pub fn recompute_checksum(&mut self) {
         let crc = compute_checksum(&self.bytes);
