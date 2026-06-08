@@ -94,6 +94,37 @@ pub struct Peak {
     pub intensity: f32,
 }
 
+/// A decoded FTMS profile: a frequency grid plus contiguous signal chunks.
+///
+/// The profile is stored as a sparse set of `chunks` over a uniform frequency
+/// grid (`first_value` + bin·`step`). Converting a bin to m/z needs the
+/// per-scan frequency→m/z calibration (not yet ported), so this struct exposes
+/// the grid verbatim — enough to rewrite intensities in place
+/// ([`RawFile::set_profile_intensities`]) on a template's real m/z grid.
+#[derive(Clone, Debug)]
+pub struct Profile {
+    pub first_value: f64,
+    pub step: f64,
+    /// Total number of bins in the (sparse) grid.
+    pub nbins: u32,
+    pub chunks: Vec<ProfileChunk>,
+}
+
+impl Profile {
+    /// Total number of stored signal points across all chunks.
+    pub fn point_count(&self) -> usize {
+        self.chunks.iter().map(|c| c.signal.len()).sum()
+    }
+}
+
+/// One contiguous run of profile signal points starting at `first_bin`.
+#[derive(Clone, Debug)]
+pub struct ProfileChunk {
+    pub first_bin: u32,
+    pub fudge: f32,
+    pub signal: Vec<f32>,
+}
+
 struct MsRunHeader {
     first_scan: u32,
     last_scan: u32,
@@ -301,6 +332,54 @@ impl RawFile {
         peaks
     }
 
+    /// Decode the FTMS profile for `scan` (1-based), or `None` if the scan has
+    /// no profile (centroid-only, e.g. ASTMS MS2). The profile is the chunked
+    /// frequency-grid signal that precedes the centroid label list in the packet.
+    pub fn profile(&self, scan: u32) -> Option<Profile> {
+        if scan < self.first_scan || scan > self.last_scan {
+            return None;
+        }
+        let e = &self.index[(scan - self.first_scan) as usize];
+        let pos = (self.data_addr + e.offset) as usize;
+        let mut c = Cur::new(&self.bytes, pos);
+        let _unknown1 = c.u32();
+        let profile_size = c.u32();
+        let _peaklist_size = c.u32();
+        let layout = c.u32();
+        c.skip(16);
+        let _low = c.f32();
+        let _high = c.f32();
+        if profile_size == 0 {
+            return None;
+        }
+        let first_value = c.f64();
+        let step = c.f64();
+        let peak_count = c.u32();
+        let nbins = c.u32();
+        let mut chunks = Vec::with_capacity(peak_count as usize);
+        for _ in 0..peak_count {
+            let first_bin = c.u32();
+            let cn = c.u32();
+            // Fudge is present only when the packet layout flag is non-zero.
+            let fudge = if layout > 0 { c.f32() } else { 0.0 };
+            let mut signal = Vec::with_capacity(cn as usize);
+            for _ in 0..cn {
+                signal.push(c.f32());
+            }
+            chunks.push(ProfileChunk {
+                first_bin,
+                fudge,
+                signal,
+            });
+        }
+        Some(Profile {
+            first_value,
+            step,
+            nbins,
+            chunks,
+        })
+    }
+
     /// The checksum stored in the file header.
     pub fn stored_checksum(&self) -> u32 {
         stored_checksum(&self.bytes)
@@ -413,6 +492,74 @@ impl RawFile {
             base_mz,
             low_mz,
             high_mz,
+            ..entry
+        };
+        Ok(())
+    }
+
+    /// Overwrite an FTMS profile's signal intensities in place, in chunk order.
+    ///
+    /// `signal` must have the same total length as the existing profile
+    /// ([`Profile::point_count`]); the frequency grid (chunk first-bins / step /
+    /// m/z calibration) is preserved, so this rewrites intensities onto the
+    /// template's real m/z axis — the basis for emitting a simulated MS1 onto a
+    /// real Astral/Orbitrap grid. Recomputes the scan-index TIC and base
+    /// intensity; the m/z range and base-peak m/z are left unchanged (the grid
+    /// is unchanged, and base-peak m/z needs the frequency→m/z calibration,
+    /// which is a follow-up). Call [`RawFile::save`] to fix the checksum.
+    pub fn set_profile_intensities(&mut self, scan: u32, signal: &[f32]) -> io::Result<()> {
+        if scan < self.first_scan || scan > self.last_scan {
+            return Err(err("scan out of range"));
+        }
+        let idx = (scan - self.first_scan) as usize;
+        let entry = self.index[idx].clone();
+        let pkt = (self.data_addr + entry.offset) as usize;
+
+        let profile_size = u32::from_le_bytes(self.bytes[pkt + 4..pkt + 8].try_into().unwrap());
+        if profile_size == 0 {
+            return Err(err("scan has no profile (centroid-only)"));
+        }
+        let layout = u32::from_le_bytes(self.bytes[pkt + 12..pkt + 16].try_into().unwrap());
+
+        // Walk the chunk headers to collect the byte offset of every signal value.
+        let mut c = Cur::new(&self.bytes, pkt + 40);
+        let _first_value = c.f64();
+        let _step = c.f64();
+        let peak_count = c.u32();
+        let _nbins = c.u32();
+        let mut offsets: Vec<usize> = Vec::new();
+        for _ in 0..peak_count {
+            let _first_bin = c.u32();
+            let cn = c.u32();
+            if layout > 0 {
+                c.skip(4); // fudge
+            }
+            for _ in 0..cn {
+                offsets.push(c.p);
+                c.skip(4);
+            }
+        }
+        if signal.len() != offsets.len() {
+            return Err(err(
+                "signal length must equal the existing profile point count (Profile::point_count)",
+            ));
+        }
+
+        let mut tic = 0f64;
+        let mut base_int = 0f64;
+        for (&off, &v) in offsets.iter().zip(signal) {
+            put_f32(&mut self.bytes, off, v);
+            tic += v as f64;
+            base_int = base_int.max(v as f64);
+        }
+
+        // Scan-index entry: TIC @ +32, base-int @ +40. base-mz/low-mz/high-mz
+        // are left as-is (grid unchanged; base-peak m/z needs the calibration).
+        let ea = self.scan_index_addr as usize + idx * scan_index_entry_size(self.version);
+        put_f64(&mut self.bytes, ea + 32, tic);
+        put_f64(&mut self.bytes, ea + 40, base_int);
+        self.index[idx] = ScanIndexEntry {
+            total_current: tic,
             ..entry
         };
         Ok(())
