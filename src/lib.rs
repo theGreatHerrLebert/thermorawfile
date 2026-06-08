@@ -262,6 +262,108 @@ impl RawFile {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Writer (template-mutation): rewrite scan data in an existing file, then fix
+// the index stats and the integrity checksum. Same-count peak rewrites need no
+// offset rebuild; variable counts are TODO.
+// ---------------------------------------------------------------------------
+
+fn put_u32(b: &mut [u8], off: usize, v: u32) {
+    b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+fn put_f32(b: &mut [u8], off: usize, v: f32) {
+    b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+fn put_f64(b: &mut [u8], off: usize, v: f64) {
+    b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+impl RawFile {
+    /// Overwrite a scan's centroid peak list in place. The new list must have the
+    /// **same number of peaks** as the current one (variable counts require a scan-
+    /// index offset rebuild — TODO). Recomputes the scan-index stats (TIC, base
+    /// peak, m/z range) and the packet-header m/z range so the file stays
+    /// internally consistent. Call [`RawFile::save`] afterwards to fix the checksum.
+    pub fn set_centroid_peaks(&mut self, scan: u32, peaks: &[Peak]) -> io::Result<()> {
+        if scan < self.first_scan || scan > self.last_scan {
+            return Err(err("scan out of range"));
+        }
+        let idx = (scan - self.first_scan) as usize;
+        let entry = self.index[idx].clone();
+        let pkt = (self.data_addr + entry.offset) as usize;
+
+        let profile_size = u32::from_le_bytes(self.bytes[pkt + 4..pkt + 8].try_into().unwrap());
+        let peaklist_size = u32::from_le_bytes(self.bytes[pkt + 8..pkt + 12].try_into().unwrap());
+        if profile_size != 0 || peaklist_size == 0 {
+            return Err(err("not a centroid-only scan (profile rewrite is TODO)"));
+        }
+        let count = u32::from_le_bytes(self.bytes[pkt + 40..pkt + 44].try_into().unwrap()) as usize;
+        if peaks.len() != count {
+            return Err(err(
+                "peak count must equal the existing count (variable-count rewrite is TODO)",
+            ));
+        }
+
+        // Write peaks: 12 bytes each — f64 m/z, f32 intensity.
+        let peaks_off = pkt + 44;
+        let mut tic = 0f64;
+        let mut base_mz = 0f64;
+        let mut base_int = 0f64;
+        let mut low_mz = f64::INFINITY;
+        let mut high_mz = f64::NEG_INFINITY;
+        for (i, p) in peaks.iter().enumerate() {
+            put_f64(&mut self.bytes, peaks_off + i * 12, p.mz);
+            put_f32(&mut self.bytes, peaks_off + i * 12 + 8, p.intensity);
+            tic += p.intensity as f64;
+            if (p.intensity as f64) > base_int {
+                base_int = p.intensity as f64;
+                base_mz = p.mz;
+            }
+            low_mz = low_mz.min(p.mz);
+            high_mz = high_mz.max(p.mz);
+        }
+        if peaks.is_empty() {
+            low_mz = 0.0;
+            high_mz = 0.0;
+        }
+
+        // Packet header m/z range (f32 @ +32 / +36).
+        put_f32(&mut self.bytes, pkt + 32, low_mz as f32);
+        put_f32(&mut self.bytes, pkt + 36, high_mz as f32);
+
+        // Scan-index entry stats (f64): TIC @ +32, base-int @ +40, base-mz @ +48,
+        // low-mz @ +56, high-mz @ +64.
+        let ea = self.scan_index_addr as usize + idx * scan_index_entry_size(self.version);
+        put_f64(&mut self.bytes, ea + 32, tic);
+        put_f64(&mut self.bytes, ea + 40, base_int);
+        put_f64(&mut self.bytes, ea + 48, base_mz);
+        put_f64(&mut self.bytes, ea + 56, low_mz);
+        put_f64(&mut self.bytes, ea + 64, high_mz);
+
+        // Refresh the cached entry.
+        self.index[idx] = ScanIndexEntry {
+            total_current: tic,
+            base_mz,
+            low_mz,
+            high_mz,
+            ..entry
+        };
+        Ok(())
+    }
+
+    /// Recompute and write the Adler-32 integrity checksum into the header.
+    pub fn recompute_checksum(&mut self) {
+        let crc = compute_checksum(&self.bytes);
+        put_u32(&mut self.bytes, CHECKSUM_OFFSET, crc);
+    }
+
+    /// Fix the checksum and write the file to disk.
+    pub fn save<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
+        self.recompute_checksum();
+        std::fs::write(path, &self.bytes)
+    }
+}
+
 fn read_version(b: &[u8]) -> u32 {
     u32::from_le_bytes(b[36..40].try_into().unwrap())
 }
