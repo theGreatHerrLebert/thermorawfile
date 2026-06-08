@@ -3,7 +3,10 @@
 //! Binary layout ported from `unthermo` (Apache-2.0, Pieter Kelchtermans /
 //! proteinspector) and corrected/extended against real rev-66 files using the
 //! Thermo RawFileReader as an oracle. Notable correction vs. unthermo: rev-66
-//! centroid peaks are `{ f64 m/z, f32 intensity }` (12 bytes), not `{ f32, f32 }`.
+//! FTMS centroid peaks are `{ f64 m/z, f32 intensity }` (12 bytes), not
+//! `{ f32, f32 }` — *except* the Astral analyzer (ASTMS), whose centroid peaks
+//! are `{ f32 m/z, f32 intensity }` (8 bytes). The width is selected per scan
+//! from the peak-list word count (see [`peak_is_wide`]).
 //!
 //! Scope of this foundation: structural chain + centroid peak lists + the
 //! Adler-32 integrity checksum, for file revisions >= 64 (Orbitrap-era). Profile
@@ -139,6 +142,21 @@ fn err(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
+/// Width of a centroid peak record, selected per scan.
+///
+/// The packet's `peaklist_size` is a count of 4-byte words including the leading
+/// `u32` peak count, so `(peaklist_size - 1) / count` is the words per peak:
+/// FTMS-style packets (e.g. Orbitrap Velos) use 3 words = 12 bytes
+/// `{ f64 m/z, f32 intensity }`; the Astral analyzer (ASTMS) uses 2 words =
+/// 8 bytes `{ f32 m/z, f32 intensity }`. Returns `true` for the wide (12-byte)
+/// form. Defaults to wide when the count is unknown/inconsistent.
+fn peak_is_wide(peaklist_size: u32, count: u32) -> bool {
+    if count == 0 {
+        return true;
+    }
+    peaklist_size.saturating_sub(1) / count >= 3
+}
+
 impl RawFile {
     /// Read and parse a `.raw` file (structural chain + scan index).
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
@@ -272,9 +290,10 @@ impl RawFile {
         let mut peaks = Vec::new();
         if profile_size == 0 && peaklist_size > 0 {
             let count = c.u32();
+            let wide = peak_is_wide(peaklist_size, count);
             peaks.reserve(count as usize);
             for _ in 0..count {
-                let mz = c.f64();
+                let mz = if wide { c.f64() } else { c.f32() as f64 };
                 let intensity = c.f32();
                 peaks.push(Peak { mz, intensity });
             }
@@ -333,6 +352,7 @@ impl RawFile {
         if profile_size != 0 || peaklist_size == 0 {
             return Err(err("not a centroid-only scan (profile rewrite is TODO)"));
         }
+        let peaklist_size = u32::from_le_bytes(self.bytes[pkt + 8..pkt + 12].try_into().unwrap());
         let count = u32::from_le_bytes(self.bytes[pkt + 40..pkt + 44].try_into().unwrap()) as usize;
         if peaks.len() != count {
             return Err(err(
@@ -340,7 +360,10 @@ impl RawFile {
             ));
         }
 
-        // Write peaks: 12 bytes each — f64 m/z, f32 intensity.
+        // Peak record width is analyzer-dependent: 12 bytes { f64 m/z, f32 int }
+        // for FTMS, 8 bytes { f32 m/z, f32 int } for the Astral analyzer (ASTMS).
+        let wide = peak_is_wide(peaklist_size, count as u32);
+        let stride = if wide { 12 } else { 8 };
         let peaks_off = pkt + 44;
         let mut tic = 0f64;
         let mut base_mz = 0f64;
@@ -348,15 +371,23 @@ impl RawFile {
         let mut low_mz = f64::INFINITY;
         let mut high_mz = f64::NEG_INFINITY;
         for (i, p) in peaks.iter().enumerate() {
-            put_f64(&mut self.bytes, peaks_off + i * 12, p.mz);
-            put_f32(&mut self.bytes, peaks_off + i * 12 + 8, p.intensity);
+            // Stats must reflect the value actually stored, so for the narrow
+            // form use the f32-rounded m/z (what the reader will read back).
+            let mz_stored = if wide { p.mz } else { (p.mz as f32) as f64 };
+            if wide {
+                put_f64(&mut self.bytes, peaks_off + i * stride, p.mz);
+                put_f32(&mut self.bytes, peaks_off + i * stride + 8, p.intensity);
+            } else {
+                put_f32(&mut self.bytes, peaks_off + i * stride, p.mz as f32);
+                put_f32(&mut self.bytes, peaks_off + i * stride + 4, p.intensity);
+            }
             tic += p.intensity as f64;
             if (p.intensity as f64) > base_int {
                 base_int = p.intensity as f64;
-                base_mz = p.mz;
+                base_mz = mz_stored;
             }
-            low_mz = low_mz.min(p.mz);
-            high_mz = high_mz.max(p.mz);
+            low_mz = low_mz.min(mz_stored);
+            high_mz = high_mz.max(mz_stored);
         }
         if peaks.is_empty() {
             low_mz = 0.0;
