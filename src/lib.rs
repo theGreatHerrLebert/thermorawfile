@@ -954,15 +954,20 @@ impl RawFile {
             true
         };
 
-        // Accumulate the real signal per bin, then add the simulated peaks.
+        // Accumulate the real signal per bin in f64 (lossless for f32 reals and
+        // avoids losing small simulated contributions beside large real ones),
+        // then add the simulated peaks.
         use std::collections::BTreeMap;
-        let mut acc: BTreeMap<u32, f32> = BTreeMap::new();
+        let mut acc: BTreeMap<u32, f64> = BTreeMap::new();
         for ch in &prof.chunks {
             for (j, &v) in ch.signal.iter().enumerate() {
-                *acc.entry(ch.first_bin + j as u32).or_insert(0.0) += v;
+                *acc.entry(ch.first_bin + j as u32).or_insert(0.0) += v as f64;
             }
         }
         for &(mz, inten) in sim_peaks {
+            if !inten.is_finite() || inten < 0.0 {
+                return Err(err("sim peak intensity must be finite and non-negative"));
+            }
             let f = calib
                 .freq(mz)
                 .ok_or_else(|| err("sim peak m/z unreachable by this calibration"))?;
@@ -970,16 +975,21 @@ impl RawFile {
             if !b.is_finite() || b < 0.0 || b >= nbins as f64 {
                 return Err(err("sim peak m/z falls outside the scan's frequency grid"));
             }
-            *acc.entry(b as u32).or_insert(0.0) += inten;
+            *acc.entry(b as u32).or_insert(0.0) += inten as f64;
         }
 
-        // Build contiguous chunks from the sorted (bin, value) map.
+        // Build contiguous chunks; convert accumulated f64 → f32 (the stored
+        // signal type), rejecting any overflow to non-finite.
         struct Ck {
             first_bin: u32,
             signal: Vec<f32>,
         }
         let mut chunks: Vec<Ck> = Vec::new();
-        for (bin, v) in acc {
+        for (bin, vf) in acc {
+            let v = vf as f32;
+            if !v.is_finite() {
+                return Err(err("accumulated profile intensity overflowed to non-finite"));
+            }
             match chunks.last_mut() {
                 Some(c) if c.first_bin + c.signal.len() as u32 == bin => c.signal.push(v),
                 _ => chunks.push(Ck {
@@ -1121,28 +1131,60 @@ impl RawFile {
         sim_peaks: &[(f64, f32)],
         merge_tol_ppm: f64,
     ) -> io::Result<()> {
+        if !merge_tol_ppm.is_finite() || merge_tol_ppm < 0.0 {
+            return Err(err("merge_tol_ppm must be finite and non-negative"));
+        }
+        if scan < self.first_scan || scan > self.last_scan {
+            return Err(err("scan out of range"));
+        }
+        // Require a centroid-only scan: centroid_peaks() returns empty for a
+        // profile scan, which would otherwise let us silently discard the real
+        // FTMS profile. (Use overlay_profile for profile scans.)
+        let idx = (scan - self.first_scan) as usize;
+        let pkt = (self.data_addr + self.index[idx].offset) as usize;
+        if pkt + 12 > self.bytes.len() {
+            return Err(err("packet extends past end of file"));
+        }
+        let profile_size = u32::from_le_bytes(self.bytes[pkt + 4..pkt + 8].try_into().unwrap());
+        let peaklist_size = u32::from_le_bytes(self.bytes[pkt + 8..pkt + 12].try_into().unwrap());
+        if profile_size != 0 || peaklist_size == 0 {
+            return Err(err(
+                "overlay_centroids requires a centroid-only scan (use overlay_profile for FTMS profile)",
+            ));
+        }
+
         let mut all: Vec<(f64, f32)> = self
             .centroid_peaks(scan)
             .iter()
             .map(|p| (p.mz, p.intensity))
             .collect();
-        all.extend_from_slice(sim_peaks);
+        for &(mz, inten) in sim_peaks {
+            if !mz.is_finite() || mz <= 0.0 || !inten.is_finite() || inten < 0.0 {
+                return Err(err("sim centroid must have finite m/z>0 and finite intensity>=0"));
+            }
+            all.push((mz, inten));
+        }
         all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        // Merge neighbours within tolerance: intensity-weighted m/z, summed int.
+        // Cluster by transitive adjacency: a peak merges into the current cluster
+        // when it is within tolerance of the PREVIOUS INPUT peak (not the moving
+        // intensity-weighted centroid), so A–B–C chains coalesce correctly.
         let mut merged: Vec<(f64, f32)> = Vec::with_capacity(all.len());
+        let mut last_in_mz = f64::NEG_INFINITY;
         for (mz, inten) in all {
-            match merged.last_mut() {
-                Some((pmz, pint))
-                    if (mz - *pmz).abs() / mz * 1.0e6 <= merge_tol_ppm =>
-                {
+            let adjacent =
+                last_in_mz.is_finite() && (mz - last_in_mz).abs() / mz * 1.0e6 <= merge_tol_ppm;
+            if adjacent {
+                if let Some((pmz, pint)) = merged.last_mut() {
                     let w = *pint as f64 + inten as f64;
                     if w > 0.0 {
                         *pmz = (*pmz * *pint as f64 + mz * inten as f64) / w;
                     }
                     *pint += inten;
                 }
-                _ => merged.push((mz, inten)),
+            } else {
+                merged.push((mz, inten));
             }
+            last_in_mz = mz;
         }
         self.author_centroids(scan, &merged)
     }
@@ -1186,14 +1228,25 @@ impl RawFile {
         let peaklist_words = u32::from_le_bytes(self.bytes[pkt + 8..pkt + 12].try_into().unwrap());
         let centroid_wide = if profile_size == 0 && peaklist_words > 0 && pkt + 44 <= self.bytes.len() {
             let cnt = u32::from_le_bytes(self.bytes[pkt + 40..pkt + 44].try_into().unwrap());
-            peak_is_wide(peaklist_words, cnt)
+            // An empty native peaklist (cnt == 0) can't communicate its width via
+            // (size-1)/cnt; fall back to the narrow ASTMS form rather than wide.
+            if cnt > 0 {
+                peak_is_wide(peaklist_words, cnt)
+            } else {
+                false
+            }
         } else {
             false // ASTMS default
         };
         let centroid_bytes = if centroid_wide { 12usize } else { 8 };
 
-        // Sort by m/z and merge exact-duplicate m/z.
+        // Validate inputs, sort by m/z.
         let mut pk: Vec<(f64, f32)> = peaks.to_vec();
+        for &(mz, inten) in &pk {
+            if !mz.is_finite() || mz <= 0.0 || !inten.is_finite() || inten < 0.0 {
+                return Err(err("centroid must have finite m/z>0 and finite intensity>=0"));
+            }
+        }
         pk.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let k = pk.len();
         let new_pl_bytes = 4 + k * centroid_bytes;
@@ -1213,13 +1266,15 @@ impl RawFile {
         let mut low_mz = f64::INFINITY;
         let mut high_mz = f64::NEG_INFINITY;
         for &(mz, inten) in &pk {
+            // Stats must reflect the value actually stored (narrow = f32 m/z).
+            let mz_stored = if centroid_wide { mz } else { (mz as f32) as f64 };
             tic += inten as f64;
             if inten as f64 > base_int {
                 base_int = inten as f64;
-                base_mz = mz;
+                base_mz = mz_stored;
             }
-            low_mz = low_mz.min(mz);
-            high_mz = high_mz.max(mz);
+            low_mz = low_mz.min(mz_stored);
+            high_mz = high_mz.max(mz_stored);
         }
         if pk.is_empty() {
             low_mz = 0.0;
