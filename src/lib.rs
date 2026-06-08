@@ -901,6 +901,140 @@ impl RawFile {
         Ok(())
     }
 
+    /// Author a *new* centroid-only spectrum of arbitrary peak count into `scan`
+    /// (e.g. an Astral ASTMS MS2 scan), writing the peaks directly — centroids
+    /// store m/z, so no calibration is needed.
+    ///
+    /// Like [`RawFile::author_profile`] but for centroid-only packets: emits a
+    /// peaklist (native record width) + a matching peak-descriptor list, stays
+    /// within the existing packet budget, and keeps the scan-index `offset` and
+    /// `DataPacketSize` unchanged (rebuilt sections are bounded by their size
+    /// fields; the remainder is zeroed slack). Recomputes the scan-index stats.
+    /// Call [`RawFile::save`] to fix the checksum.
+    pub fn author_centroids(&mut self, scan: u32, peaks: &[(f64, f32)]) -> io::Result<()> {
+        if scan < self.first_scan || scan > self.last_scan {
+            return Err(err("scan out of range"));
+        }
+        if peaks.len() > u16::MAX as usize {
+            return Err(err("too many peaks (max 65535 per authored spectrum)"));
+        }
+        let idx = (scan - self.first_scan) as usize;
+        let entry = self.index[idx].clone();
+        let pkt = (self.data_addr + entry.offset) as usize;
+        let old_len = entry.data_packet_size as usize;
+        if pkt.checked_add(old_len).map_or(true, |e| e > self.bytes.len()) {
+            return Err(err("packet extends past end of file"));
+        }
+        if idx + 1 < self.index.len() {
+            let next = (self.data_addr + self.index[idx + 1].offset) as usize;
+            if next < pkt || next - pkt < old_len {
+                return Err(err("packet would overrun the next scan's data"));
+            }
+        }
+
+        let unknown1 = u32::from_le_bytes(self.bytes[pkt..pkt + 4].try_into().unwrap());
+        let layout = u32::from_le_bytes(self.bytes[pkt + 12..pkt + 16].try_into().unwrap());
+        // Native centroid record width from the existing centroid-only packet
+        // (profile_size == 0 ⇒ peaklist count is at +40).
+        let profile_size = u32::from_le_bytes(self.bytes[pkt + 4..pkt + 8].try_into().unwrap());
+        let peaklist_words = u32::from_le_bytes(self.bytes[pkt + 8..pkt + 12].try_into().unwrap());
+        let centroid_wide = if profile_size == 0 && peaklist_words > 0 && pkt + 44 <= self.bytes.len() {
+            let cnt = u32::from_le_bytes(self.bytes[pkt + 40..pkt + 44].try_into().unwrap());
+            peak_is_wide(peaklist_words, cnt)
+        } else {
+            false // ASTMS default
+        };
+        let centroid_bytes = if centroid_wide { 12usize } else { 8 };
+
+        // Sort by m/z and merge exact-duplicate m/z.
+        let mut pk: Vec<(f64, f32)> = peaks.to_vec();
+        pk.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let k = pk.len();
+        let new_pl_bytes = 4 + k * centroid_bytes;
+        let descriptor_bytes = k * 4;
+        let new_len = 40 + new_pl_bytes + descriptor_bytes;
+        if new_len > old_len {
+            return Err(err("authored centroids exceed the scan's packet budget"));
+        }
+        let new_pl_words =
+            u32::try_from(new_pl_bytes / 4).map_err(|_| err("peaklist too large"))?;
+        let k_u32 = k as u32;
+
+        // Stats.
+        let mut tic = 0f64;
+        let mut base_int = 0f64;
+        let mut base_mz = 0f64;
+        let mut low_mz = f64::INFINITY;
+        let mut high_mz = f64::NEG_INFINITY;
+        for &(mz, inten) in &pk {
+            tic += inten as f64;
+            if inten as f64 > base_int {
+                base_int = inten as f64;
+                base_mz = mz;
+            }
+            low_mz = low_mz.min(mz);
+            high_mz = high_mz.max(mz);
+        }
+        if pk.is_empty() {
+            low_mz = 0.0;
+            high_mz = 0.0;
+        }
+
+        // Header: profile_size = 0, peaklist + descriptors of length K.
+        put_u32(&mut self.bytes, pkt, unknown1);
+        put_u32(&mut self.bytes, pkt + 4, 0); // profile_size
+        put_u32(&mut self.bytes, pkt + 8, new_pl_words); // peaklist_size (words)
+        put_u32(&mut self.bytes, pkt + 12, layout);
+        put_u32(&mut self.bytes, pkt + 16, k_u32); // descriptor_list_size
+        put_u32(&mut self.bytes, pkt + 20, 0); // unknown_stream_size
+        put_u32(&mut self.bytes, pkt + 24, 0); // triplet_stream_size
+        put_u32(&mut self.bytes, pkt + 28, 0); // unknown2
+        put_f32(&mut self.bytes, pkt + 32, low_mz as f32);
+        put_f32(&mut self.bytes, pkt + 36, high_mz as f32);
+
+        // Peaklist: count + native-width records.
+        let mut o = pkt + 40;
+        put_u32(&mut self.bytes, o, k_u32);
+        o += 4;
+        for &(mz, inten) in &pk {
+            if centroid_wide {
+                put_f64(&mut self.bytes, o, mz);
+                put_f32(&mut self.bytes, o + 8, inten);
+            } else {
+                put_f32(&mut self.bytes, o, mz as f32);
+                put_f32(&mut self.bytes, o + 4, inten);
+            }
+            o += centroid_bytes;
+        }
+        // Peak-descriptor list.
+        for i in 0..k {
+            self.bytes[o..o + 2].copy_from_slice(&(i as u16).to_le_bytes());
+            self.bytes[o + 2] = 0;
+            self.bytes[o + 3] = 0;
+            o += 4;
+        }
+        debug_assert_eq!(o, pkt + new_len);
+        for b in &mut self.bytes[pkt + new_len..pkt + old_len] {
+            *b = 0;
+        }
+
+        // Scan-index stats; offset + DataPacketSize unchanged.
+        let ea = self.scan_index_addr as usize + idx * scan_index_entry_size(self.version);
+        put_f64(&mut self.bytes, ea + 32, tic);
+        put_f64(&mut self.bytes, ea + 40, base_int);
+        put_f64(&mut self.bytes, ea + 48, base_mz);
+        put_f64(&mut self.bytes, ea + 56, low_mz);
+        put_f64(&mut self.bytes, ea + 64, high_mz);
+        self.index[idx] = ScanIndexEntry {
+            total_current: tic,
+            base_mz,
+            low_mz,
+            high_mz,
+            ..entry
+        };
+        Ok(())
+    }
+
     /// Recompute and write the Adler-32 integrity checksum into the header.
     pub fn recompute_checksum(&mut self) {
         let crc = compute_checksum(&self.bytes);
