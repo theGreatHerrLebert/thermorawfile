@@ -265,17 +265,36 @@ fn err(msg: &str) -> io::Error {
 
 /// Width of a centroid peak record, selected per scan.
 ///
-/// The packet's `peaklist_size` is a count of 4-byte words including the leading
-/// `u32` peak count, so `(peaklist_size - 1) / count` is the words per peak:
-/// FTMS-style packets (e.g. Orbitrap Velos) use 3 words = 12 bytes
-/// `{ f64 m/z, f32 intensity }`; the Astral analyzer (ASTMS) uses 2 words =
-/// 8 bytes `{ f32 m/z, f32 intensity }`. Returns `true` for the wide (12-byte)
-/// form. Defaults to wide when the count is unknown/inconsistent.
-fn peak_is_wide(peaklist_size: u32, count: u32) -> bool {
-    if count == 0 {
-        return true;
+/// Centroid record width in BYTES, from the EXACT peaklist-word equation.
+///
+/// `peaklist_size` counts 4-byte words including the leading `u32` peak count, so a
+/// list of `count` peaks of `r` words each is `1 + r*count` words. Two layouts:
+/// - narrow (Astral ASTMS, and older FTMS e.g. QE-HF): `{ f32 m/z, f32 int }`,
+///   2 words = 8 bytes  ⇔  `peaklist_size == 1 + 2*count`
+/// - wide (FTMS f64 m/z, e.g. Orbitrap Velos/Exploris): `{ f64 m/z, f32 int }`,
+///   3 words = 12 bytes ⇔  `peaklist_size == 1 + 3*count`
+///
+/// Returns `None` for any other (ambiguous / unknown) layout. Detection MUST be exact
+/// rather than a `(size-1)/count` quotient, which integer-division-rounds an
+/// off-by-a-few-words packet into the wrong class and then silently truncates f64 m/z
+/// to f32 (or mis-reads it) while the checksum still validates. Write callers fail
+/// closed on `None`; the read helper falls back to narrow (lenient decode).
+fn centroid_record_width(peaklist_size: u32, count: u32) -> Option<usize> {
+    let (w, c) = (peaklist_size as u64, count as u64);
+    if w == 1 + 2 * c {
+        Some(8)
+    } else if w == 1 + 3 * c {
+        Some(12)
+    } else {
+        None
     }
-    peaklist_size.saturating_sub(1) / count >= 3
+}
+
+/// Whether a centroid peak list uses the wide (12-byte) record. Read-path helper:
+/// an ambiguous layout falls back to narrow (lenient decode of whatever peaks are
+/// present); the write path uses [`centroid_record_width`] directly and fails closed.
+fn peak_is_wide(peaklist_size: u32, count: u32) -> bool {
+    centroid_record_width(peaklist_size, count) == Some(12)
 }
 
 impl RawFile {
@@ -1226,19 +1245,31 @@ impl RawFile {
         // (profile_size == 0 ⇒ peaklist count is at +40).
         let profile_size = u32::from_le_bytes(self.bytes[pkt + 4..pkt + 8].try_into().unwrap());
         let peaklist_words = u32::from_le_bytes(self.bytes[pkt + 8..pkt + 12].try_into().unwrap());
-        let centroid_wide = if profile_size == 0 && peaklist_words > 0 && pkt + 44 <= self.bytes.len() {
+        // Determine the native centroid record width from the EXISTING packet and FAIL
+        // CLOSED on an unrecognized layout — writing the wrong width silently corrupts
+        // m/z (truncates f64->f32, or shifts every record) while the Adler-32 still
+        // validates, the worst kind of failure. An empty native peaklist carries no
+        // width signal, so default to narrow (the dominant centroid form: ASTMS MS2 and
+        // older-FTMS MS2 are both narrow).
+        let centroid_bytes: usize = if profile_size == 0 && pkt + 44 <= self.bytes.len() {
             let cnt = u32::from_le_bytes(self.bytes[pkt + 40..pkt + 44].try_into().unwrap());
-            // An empty native peaklist (cnt == 0) can't communicate its width via
-            // (size-1)/cnt; fall back to the narrow ASTMS form rather than wide.
-            if cnt > 0 {
-                peak_is_wide(peaklist_words, cnt)
+            if cnt == 0 {
+                8
             } else {
-                false
+                centroid_record_width(peaklist_words, cnt).ok_or_else(|| {
+                    err("centroid packet has an unrecognized peaklist layout (words \
+                         match neither 1+2*count nor 1+3*count); refusing to author to \
+                         avoid silent m/z corruption")
+                })?
             }
+        } else if profile_size == 0 {
+            8 // packet too short to read the count field — narrow default
         } else {
-            false // ASTMS default
+            // author_centroids targets centroid-only packets; a profile-bearing packet
+            // is not something we can safely rewrite as a pure peak list.
+            return Err(err("author_centroids: packet is not centroid-only (has a profile)"));
         };
-        let centroid_bytes = if centroid_wide { 12usize } else { 8 };
+        let centroid_wide = centroid_bytes == 12;
 
         // Validate inputs, sort by m/z.
         let mut pk: Vec<(f64, f32)> = peaks.to_vec();
@@ -1459,4 +1490,35 @@ fn adler32_seed0(data: &[u8]) -> u32 {
         b = (b + a) % BASE;
     }
     (b << 16) | a
+}
+
+#[cfg(test)]
+mod centroid_width_tests {
+    use super::{centroid_record_width, peak_is_wide};
+
+    #[test]
+    fn exact_equations() {
+        // narrow: 1 + 2*count words
+        assert_eq!(centroid_record_width(1 + 2 * 732, 732), Some(8)); // real QE-HF MS2
+        assert_eq!(centroid_record_width(1, 0), Some(8)); // empty narrow (1 word: just count)
+        // wide: 1 + 3*count words
+        assert_eq!(centroid_record_width(1 + 3 * 732, 732), Some(12));
+        assert_eq!(centroid_record_width(1 + 3 * 1, 1), Some(12));
+    }
+
+    #[test]
+    fn ambiguous_is_none_not_a_guess() {
+        // off by a few words (e.g. trailing descriptor/unknown bytes counted) must NOT
+        // be rounded into a class by integer division — it is unrecognized.
+        assert_eq!(centroid_record_width(1 + 2 * 732 + 5, 732), None);
+        assert_eq!(centroid_record_width(1 + 3 * 732 - 1, 732), None);
+        assert_eq!(centroid_record_width(0, 10), None);
+    }
+
+    #[test]
+    fn peak_is_wide_matches_width() {
+        assert!(!peak_is_wide(1 + 2 * 100, 100)); // narrow
+        assert!(peak_is_wide(1 + 3 * 100, 100)); // wide
+        assert!(!peak_is_wide(1 + 2 * 100 + 3, 100)); // ambiguous -> narrow (lenient read)
+    }
 }
