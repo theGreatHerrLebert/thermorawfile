@@ -1503,6 +1503,154 @@ fn adler32_seed0(data: &[u8]) -> u32 {
     (b << 16) | a
 }
 
+// ---------------------------------------------------------------------------
+// Robustness guards. Every Thermo failure we hit was a *silent* mis-read or
+// mis-write that round-tripped through our own code (an Exploris run decoded as
+// all-MS1; authored peaks that read back wrong). These check parse/author output
+// against independent invariants instead of trusting self-consistency.
+// ---------------------------------------------------------------------------
+
+/// Result of [`RawFile::scan_event_consistency`] — a parse-level scan-event probe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanEventConsistency {
+    /// Scans whose event parsed.
+    pub n_checked: u32,
+    /// MS1 (`ms_order <= 1`) scans seen.
+    pub n_ms1: u32,
+    /// MSn (`ms_order >= 2`) scans seen.
+    pub n_msn: u32,
+    /// Scans whose level <-> isolation relationship is contradictory.
+    pub n_inconsistent: u32,
+    /// Scans in range whose event could not be parsed.
+    pub n_unparsed: u32,
+}
+
+impl ScanEventConsistency {
+    /// Whether the scan-event levels look reliably decoded: at least one scan
+    /// checked, no MSn-without-isolation contradictions, and both MS1 and MSn
+    /// present. A `false` is a *gross* mis-read signature (e.g. a run decoded as
+    /// all-MS1, or MSn scans missing their isolation window).
+    ///
+    /// LIMITATION: this is a cheap smoke test, not a complete validator. A *subtle*
+    /// partial level-swap (some MS2 mislabeled MS1 but still carrying a plausible
+    /// isolation field) satisfies these invariants and passes — catching that needs
+    /// an external reference (a different parser), not self-consistency.
+    pub fn looks_consistent(&self) -> bool {
+        self.n_checked > 0 && self.n_inconsistent == 0 && self.n_ms1 > 0 && self.n_msn > 0
+    }
+}
+
+/// Pure comparison core for [`RawFile::verify_centroids`] — split out so the
+/// round-trip tolerance logic is unit-testable without a file. Compares two
+/// centroid lists as m/z-sorted sets (the stored order is m/z-ascending,
+/// independent of author order). `Ok` iff equal length and every peak matches
+/// within `mz_tol_ppm` (floored at 1e-4 Th) and a small relative+absolute
+/// intensity tolerance.
+fn compare_centroids(got: &[(f64, f32)], want: &[(f64, f32)], mz_tol_ppm: f64) -> Result<(), String> {
+    if got.len() != want.len() {
+        return Err(format!("read back {} centroids, authored {}", got.len(), want.len()));
+    }
+    let bymz = |a: &&(f64, f32), b: &&(f64, f32)| {
+        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+    };
+    let mut g: Vec<&(f64, f32)> = got.iter().collect();
+    let mut w: Vec<&(f64, f32)> = want.iter().collect();
+    g.sort_by(bymz);
+    w.sort_by(bymz);
+    for (i, (gp, wp)) in g.iter().zip(w.iter()).enumerate() {
+        let mz_tol = (wp.0 * mz_tol_ppm * 1e-6).max(1e-4);
+        if (gp.0 - wp.0).abs() > mz_tol {
+            return Err(format!(
+                "peak {}: m/z read back {:.5} != authored {:.5} (tol {:.4} Th)",
+                i, gp.0, wp.0, mz_tol
+            ));
+        }
+        let int_tol = wp.1.abs() * 1e-3 + 1e-3;
+        if (gp.1 - wp.1).abs() > int_tol {
+            return Err(format!(
+                "peak {}: intensity read back {} != authored {}",
+                i, gp.1, wp.1
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl RawFile {
+    /// Robustness (reader): scan-event level/isolation self-consistency over the
+    /// first `k` scans (clamped to the file). Two parse-level invariants a correctly
+    /// decoded file satisfies: every MSn scan carries an isolation window, and both
+    /// MS1 and MSn levels are present. A violation (e.g. a run decoded as all-MS1, or
+    /// MSn scans missing their isolation window) means the scan-event preamble was
+    /// mis-decoded for this file's revision (the silent Exploris-class mis-read). We
+    /// deliberately do NOT assume MS1 lacks an isolation field — real MS1 events carry
+    /// a non-zero center, so that direction false-positives. Parse-level only: no
+    /// DIA/DDA or "useful template" judgement; that belongs to the consumer.
+    pub fn scan_event_consistency(&self, k: u32) -> ScanEventConsistency {
+        let mut c = ScanEventConsistency::default();
+        if self.last_scan < self.first_scan {
+            return c;
+        }
+        let span = self.last_scan - self.first_scan + 1;
+        let n = k.min(span).max(1);
+        for s in self.first_scan..(self.first_scan + n) {
+            let ev = match self.scan_event(s) {
+                Some(e) => e,
+                None => {
+                    c.n_unparsed += 1;
+                    continue;
+                }
+            };
+            c.n_checked += 1;
+            let has_iso = ev.isolation_center > 0.0 && ev.isolation_width > 0.0;
+            if ev.ms_order <= 1 {
+                // NB: a survey MS1's isolation field is NOT reliably zero across
+                // instruments — real MS1 events carry a non-zero center — so we do
+                // not flag "MS1 with isolation" (it false-positives on valid files).
+                c.n_ms1 += 1;
+            } else {
+                c.n_msn += 1;
+                if !has_iso {
+                    c.n_inconsistent += 1; // an MSn without an isolation window is mis-decoded
+                }
+            }
+        }
+        c
+    }
+
+    /// Robustness (writer): re-read `scan`'s centroids from the (just-authored)
+    /// in-memory bytes and verify they round-trip to `expected` within tolerance —
+    /// catching an authoring/encoding bug at write time instead of in a downstream
+    /// search. Order-independent (compares m/z-sorted sets).
+    pub fn verify_centroids(
+        &self,
+        scan: u32,
+        expected: &[(f64, f32)],
+        mz_tol_ppm: f64,
+    ) -> io::Result<()> {
+        let got: Vec<(f64, f32)> = self
+            .centroid_peaks(scan)
+            .iter()
+            .map(|p| (p.mz, p.intensity))
+            .collect();
+        compare_centroids(&got, expected, mz_tol_ppm)
+            .map_err(|m| err(&format!("write read-back failed for scan {}: {}", scan, m)))
+    }
+
+    /// Like [`RawFile::author_centroids`], but immediately verifies the round-trip:
+    /// the authored peaks must read back within `mz_tol_ppm` / intensity tolerance,
+    /// or the call errors instead of silently emitting a malformed scan.
+    pub fn author_centroids_verified(
+        &mut self,
+        scan: u32,
+        peaks: &[(f64, f32)],
+        mz_tol_ppm: f64,
+    ) -> io::Result<()> {
+        self.author_centroids(scan, peaks)?;
+        self.verify_centroids(scan, peaks, mz_tol_ppm)
+    }
+}
+
 #[cfg(test)]
 mod centroid_width_tests {
     use super::{centroid_record_width, peak_is_wide};
@@ -1531,5 +1679,66 @@ mod centroid_width_tests {
         assert!(!peak_is_wide(1 + 2 * 100, 100)); // narrow
         assert!(peak_is_wide(1 + 3 * 100, 100)); // wide
         assert!(!peak_is_wide(1 + 2 * 100 + 3, 100)); // ambiguous -> narrow (lenient read)
+    }
+}
+
+#[cfg(test)]
+mod robustness_tests {
+    use super::{compare_centroids, ScanEventConsistency};
+
+    #[test]
+    fn compare_centroids_matches_sorted_sets() {
+        // author order differs from stored (m/z-ascending) order -> still matches
+        let want = [(500.25_f64, 10.0_f32), (175.12, 100.0), (300.50, 50.0)];
+        let got = [(175.12_f64, 100.0_f32), (300.50, 50.0), (500.25, 10.0)];
+        assert!(compare_centroids(&got, &want, 5.0).is_ok());
+    }
+
+    #[test]
+    fn compare_centroids_rejects_count_mismatch() {
+        let want = [(175.12_f64, 100.0_f32), (300.50, 50.0)];
+        let got = [(175.12_f64, 100.0_f32)];
+        assert!(compare_centroids(&got, &want, 5.0).is_err());
+    }
+
+    #[test]
+    fn compare_centroids_mz_tolerance() {
+        let want = [(500.000_f64, 10.0_f32)];
+        assert!(compare_centroids(&[(500.0100, 10.0)], &want, 5.0).is_err()); // ~20 ppm: reject
+        assert!(compare_centroids(&[(500.0010, 10.0)], &want, 5.0).is_ok()); //  ~2 ppm: accept
+    }
+
+    #[test]
+    fn compare_centroids_rejects_intensity_drift() {
+        let want = [(500.0_f64, 100.0_f32)];
+        assert!(compare_centroids(&[(500.0, 150.0)], &want, 5.0).is_err());
+    }
+
+    #[test]
+    fn scan_event_consistency_verdict() {
+        type S = ScanEventConsistency;
+        let ok = S { n_checked: 10, n_ms1: 1, n_msn: 9, n_inconsistent: 0, n_unparsed: 0 };
+        assert!(ok.looks_consistent());
+        // all-MS1 (no MSn) -> the Exploris mis-read signature
+        let all_ms1 = S { n_checked: 10, n_ms1: 10, n_msn: 0, n_inconsistent: 0, n_unparsed: 0 };
+        assert!(!all_ms1.looks_consistent());
+        // a level<->isolation contradiction
+        let contra = S { n_checked: 10, n_ms1: 1, n_msn: 9, n_inconsistent: 3, n_unparsed: 0 };
+        assert!(!contra.looks_consistent());
+        // nothing parsed
+        assert!(!S::default().looks_consistent());
+    }
+
+    #[test]
+    fn scan_event_consistency_on_real_fixture() {
+        // Opt-in: set THERMORAWFILE_TEST_RAW to a known-good DIA .raw to exercise the
+        // reader-side probe end to end. Skipped when unset (CI has no vendor fixtures).
+        let path = match std::env::var("THERMORAWFILE_TEST_RAW") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let rf = super::RawFile::open(&path).expect("open fixture");
+        let c = rf.scan_event_consistency(2000);
+        assert!(c.looks_consistent(), "fixture scan-events look mis-decoded: {:?}", c);
     }
 }
