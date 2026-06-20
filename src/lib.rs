@@ -498,21 +498,32 @@ impl RawFile {
     /// variable-length scan-event walk (MS1 events are longer than MS2); for
     /// the first scan the offset is `scantrailer_addr + 4`.
     pub fn calibration_at_event(&self, event_offset: usize) -> Option<Calibration> {
-        let o = event_offset;
-        if o + 260 > self.bytes.len() {
-            return None;
+        // The calibration record — nparam (u32) followed by a@+20, b@+28, c@+36 (f64) — sits
+        // at a revision-dependent offset within the trailer event: Astral at +216 (nparam=5),
+        // Exploris/Q-Exactive at +160 (nparam=7). Rather than hard-code one revision's offset,
+        // scan for the first record with a valid nparam and finite, plausible coefficients.
+        let base = event_offset;
+        let limit = (base + 4096).min(self.bytes.len());
+        let mut o = base;
+        while o + 44 <= limit {
+            let nparam = u32::from_le_bytes(self.bytes[o..o + 4].try_into().unwrap());
+            if matches!(nparam, 4 | 5 | 7) {
+                let rd = |k: usize| f64::from_le_bytes(self.bytes[o + k..o + k + 8].try_into().unwrap());
+                let (a, b, c) = (rd(20), rd(28), rd(36));
+                if a.is_finite()
+                    && b.is_finite()
+                    && c.is_finite()
+                    && a.abs() < 1e6
+                    && b.abs() > 1.0
+                    && b.abs() < 1e15
+                    && c.abs() < 1e18
+                {
+                    return Some(Calibration { nparam, a, b, c });
+                }
+            }
+            o += 4;
         }
-        let nparam = u32::from_le_bytes(self.bytes[o + 216..o + 220].try_into().unwrap());
-        if !matches!(nparam, 4 | 5 | 7) {
-            return None;
-        }
-        let rd = |k: usize| f64::from_le_bytes(self.bytes[o + k..o + k + 8].try_into().unwrap());
-        Some(Calibration {
-            nparam,
-            a: rd(236),
-            b: rd(244),
-            c: rd(252),
-        })
+        None
     }
 
     /// The checksum stored in the file header.
