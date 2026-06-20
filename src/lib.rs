@@ -500,26 +500,45 @@ impl RawFile {
     pub fn calibration_at_event(&self, event_offset: usize) -> Option<Calibration> {
         // The calibration record — nparam (u32) followed by a@+20, b@+28, c@+36 (f64) — sits
         // at a revision-dependent offset within the trailer event: Astral at +216 (nparam=5),
-        // Exploris/Q-Exactive at +160 (nparam=7). Rather than hard-code one revision's offset,
-        // scan for the first record with a valid nparam and finite, plausible coefficients.
+        // Exploris/Q-Exactive at +160 (nparam=7). Try those two KNOWN offsets first so an
+        // accidental earlier byte pattern can't mask the real record; only then fall back to
+        // scanning the event for the first plausible record (handles unknown revisions).
         let base = event_offset;
+        let plausible = |o: usize| -> Option<Calibration> {
+            if o + 44 > self.bytes.len() {
+                return None;
+            }
+            let nparam = u32::from_le_bytes(self.bytes[o..o + 4].try_into().unwrap());
+            if !matches!(nparam, 4 | 5 | 7) {
+                return None;
+            }
+            let rd = |k: usize| f64::from_le_bytes(self.bytes[o + k..o + k + 8].try_into().unwrap());
+            let (a, b, c) = (rd(20), rd(28), rd(36));
+            if a.is_finite()
+                && b.is_finite()
+                && c.is_finite()
+                && a.abs() < 1e6
+                && b.abs() > 1.0
+                && b.abs() < 1e15
+                && c.abs() < 1e18
+            {
+                Some(Calibration { nparam, a, b, c })
+            } else {
+                None
+            }
+        };
+        // Known revision offsets first.
+        for known in [216usize, 160] {
+            if let Some(cal) = plausible(base + known) {
+                return Some(cal);
+            }
+        }
+        // Fallback: scan the event for the first plausible record.
         let limit = (base + 4096).min(self.bytes.len());
         let mut o = base;
         while o + 44 <= limit {
-            let nparam = u32::from_le_bytes(self.bytes[o..o + 4].try_into().unwrap());
-            if matches!(nparam, 4 | 5 | 7) {
-                let rd = |k: usize| f64::from_le_bytes(self.bytes[o + k..o + k + 8].try_into().unwrap());
-                let (a, b, c) = (rd(20), rd(28), rd(36));
-                if a.is_finite()
-                    && b.is_finite()
-                    && c.is_finite()
-                    && a.abs() < 1e6
-                    && b.abs() > 1.0
-                    && b.abs() < 1e15
-                    && c.abs() < 1e18
-                {
-                    return Some(Calibration { nparam, a, b, c });
-                }
+            if let Some(cal) = plausible(o) {
+                return Some(cal);
             }
             o += 4;
         }
@@ -1547,16 +1566,31 @@ impl ScanEventConsistency {
 /// within `mz_tol_ppm` (floored at 1e-4 Th) and a small relative+absolute
 /// intensity tolerance.
 fn compare_centroids(got: &[(f64, f32)], want: &[(f64, f32)], mz_tol_ppm: f64) -> Result<(), String> {
+    if !mz_tol_ppm.is_finite() || mz_tol_ppm < 0.0 {
+        return Err(format!("invalid m/z tolerance {} ppm", mz_tol_ppm));
+    }
     if got.len() != want.len() {
         return Err(format!("read back {} centroids, authored {}", got.len(), want.len()));
     }
-    let bymz = |a: &&(f64, f32), b: &&(f64, f32)| {
-        a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+    // Reject non-finite values up front: a NaN m/z or intensity would otherwise slip
+    // through every `>` comparison (NaN comparisons are false) and pass silently.
+    for (label, list) in [("read-back", got), ("authored", want)] {
+        for (i, p) in list.iter().enumerate() {
+            if !p.0.is_finite() || !p.1.is_finite() {
+                return Err(format!("{} peak {}: non-finite m/z {} / intensity {}", label, i, p.0, p.1));
+            }
+        }
+    }
+    // Sort by (m/z, intensity) — the intensity tie-break makes the pairwise match
+    // deterministic when two peaks share an m/z (otherwise sort order, hence the
+    // verdict, would depend on input order). Non-finite already rejected, so unwrap is safe.
+    let key = |a: &&(f64, f32), b: &&(f64, f32)| {
+        a.0.partial_cmp(&b.0).unwrap().then(a.1.partial_cmp(&b.1).unwrap())
     };
     let mut g: Vec<&(f64, f32)> = got.iter().collect();
     let mut w: Vec<&(f64, f32)> = want.iter().collect();
-    g.sort_by(bymz);
-    w.sort_by(bymz);
+    g.sort_by(key);
+    w.sort_by(key);
     for (i, (gp, wp)) in g.iter().zip(w.iter()).enumerate() {
         let mz_tol = (wp.0 * mz_tol_ppm * 1e-6).max(1e-4);
         if (gp.0 - wp.0).abs() > mz_tol {
@@ -1588,11 +1622,11 @@ impl RawFile {
     /// DIA/DDA or "useful template" judgement; that belongs to the consumer.
     pub fn scan_event_consistency(&self, k: u32) -> ScanEventConsistency {
         let mut c = ScanEventConsistency::default();
-        if self.last_scan < self.first_scan {
+        if k == 0 || self.last_scan < self.first_scan {
             return c;
         }
         let span = self.last_scan - self.first_scan + 1;
-        let n = k.min(span).max(1);
+        let n = k.min(span);
         for s in self.first_scan..(self.first_scan + n) {
             let ev = match self.scan_event(s) {
                 Some(e) => e,
@@ -1712,6 +1746,32 @@ mod robustness_tests {
     fn compare_centroids_rejects_intensity_drift() {
         let want = [(500.0_f64, 100.0_f32)];
         assert!(compare_centroids(&[(500.0, 150.0)], &want, 5.0).is_err());
+    }
+
+    #[test]
+    fn compare_centroids_rejects_non_finite() {
+        // NaN/inf must NOT slip through (a `>` comparison against NaN is false).
+        let want = [(500.0_f64, 100.0_f32)];
+        assert!(compare_centroids(&[(f64::NAN, 100.0)], &want, 5.0).is_err());
+        assert!(compare_centroids(&[(500.0, f32::INFINITY)], &want, 5.0).is_err());
+    }
+
+    #[test]
+    fn compare_centroids_rejects_bad_tolerance() {
+        let want = [(500.0_f64, 100.0_f32)];
+        assert!(compare_centroids(&[(500.0, 100.0)], &want, f64::NAN).is_err());
+        assert!(compare_centroids(&[(500.0, 100.0)], &want, -5.0).is_err());
+    }
+
+    #[test]
+    fn compare_centroids_handles_duplicate_mz_by_intensity_tiebreak() {
+        // two peaks at the same m/z, different intensities, given in opposite orders
+        let want = [(500.0_f64, 10.0_f32), (500.0, 90.0)];
+        let got = [(500.0_f64, 90.0_f32), (500.0, 10.0)];
+        assert!(compare_centroids(&got, &want, 5.0).is_ok());
+        // genuinely different intensities at the shared m/z must still fail
+        let bad = [(500.0_f64, 90.0_f32), (500.0, 11.0)];
+        assert!(compare_centroids(&bad, &want, 5.0).is_err());
     }
 
     #[test]
