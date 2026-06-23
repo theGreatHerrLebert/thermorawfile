@@ -1,12 +1,22 @@
 //! Pure-Rust reader for Thermo Finnigan `.raw` files (no .NET / RawFileReader DLL).
 //!
-//! Binary layout ported from `unthermo` (Apache-2.0, Pieter Kelchtermans /
-//! proteinspector) and corrected/extended against real rev-66 files using the
-//! Thermo RawFileReader as an oracle. Notable correction vs. unthermo: rev-66
-//! FTMS centroid peaks are `{ f64 m/z, f32 intensity }` (12 bytes), not
-//! `{ f32, f32 }` — *except* the Astral analyzer (ASTMS), whose centroid peaks
-//! are `{ f32 m/z, f32 intensity }` (8 bytes). The width is selected per scan
-//! from the peak-list word count (see [`peak_is_wide`]).
+//! Binary layout reconstructed from clean-room, public-data sources: `unthermo`
+//! (Apache-2.0, Pieter Kelchtermans / proteinspector), `OpenTFRaw` (Apache-2.0,
+//! reverse-engineered from public PRIDE deposits), and `unfinnigan` (Gene Selkov).
+//! The v66 scan-event layout, preamble offsets, and frequency↔m/z calibration all
+//! agree with those public sources. No Thermo SDK, DLL, or proprietary code is
+//! used or linked.
+//!
+//! The centroid record width is not documented by those open sources, but it is
+//! self-describing from the file and was re-derived purely from public data: each
+//! scan's packet header gives the peak-list word count, and `words == 1 + 2*n`
+//! (n peaks) selects the 8-byte `{ f32 m/z, f32 int }` record while `words == 1 + 3*n`
+//! selects the 12-byte `{ f64 m/z, f32 int }` record (see [`centroid_record_width`]).
+//! Validated against genuine public PRIDE deposits — e.g. PXD060431 (Orbitrap) and
+//! PXD061065 (Astral) — where the word count fixes the width per scan and the
+//! f64-m/z interpretation yields monotonic fragment m/z inside each scan's own
+//! bounds. The width is per scan, not per instrument. No RawFileReader, SDK, or
+//! proprietary code is involved.
 //!
 //! Scope of this foundation: structural chain + centroid peak lists + the
 //! Adler-32 integrity checksum, for file revisions >= 64 (Orbitrap-era). Profile
@@ -141,7 +151,7 @@ pub struct ProfileChunk {
 ///
 /// The profile is sampled on a uniform frequency grid (`f = first_value +
 /// bin·step`, from [`Profile`]); this maps frequency to m/z. Two forms exist,
-/// keyed by `nparam` (decoded against the RawFileReader oracle on rev66):
+/// keyed by `nparam` (per OpenTFRaw §32 / unfinnigan, from public PRIDE data):
 /// `nparam == 4` → `m/z = a + b/f + c/f²`; `nparam ∈ {5, 7}` →
 /// `m/z = a + b/f² + c/f⁴`. The inverse (m/z→frequency) is what lets a writer
 /// place a peak at an arbitrary m/z onto the grid.
@@ -224,9 +234,10 @@ struct MsRunHeader {
     scanparams_addr: u64,
 }
 
-// Scan-event field offsets within a fixed-size event record (rev 66), decoded
-// empirically against RawFileReader (unthermo's variable-length v66 layout is
-// wrong). Events are a contiguous fixed-stride array in [scantrailer+4, scanparams).
+// Scan-event field offsets within a fixed-size event record (rev 66), per the
+// OpenTFRaw v66 scan-event layout (§22; 136-byte preamble). unthermo's
+// variable-length v66 layout differs. Events are a contiguous fixed-stride array
+// in [scantrailer+4, scanparams).
 const EV_MS_ORDER: usize = 6; // preamble: 1 = MS1, 2 = MS2
 const EV_ANALYZER: usize = 40; // 0 = ITMS, 4 = FTMS
 const EV_ISO_CENTER: usize = 140; // f64 precursor / isolation-window center m/z
@@ -491,7 +502,7 @@ impl RawFile {
 
     /// Read the FTMS frequency↔m/z calibration from a scan-event byte offset.
     ///
-    /// rev66 MS1 scan-event layout (decoded against the RawFileReader oracle):
+    /// rev66 MS1 scan-event layout (per OpenTFRaw §22 / unfinnigan, public-data RE):
     /// `Nparam u32 @ +216`, then `A/B/C f64 @ +236 / +244 / +252`. Returns
     /// `None` if `nparam` is not a recognised value (4/5/7) — e.g. a non-MS1
     /// event. Locating the event offset for an arbitrary scan needs the

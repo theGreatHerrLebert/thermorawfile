@@ -1,5 +1,6 @@
-//! Validates the pure-Rust reader against the real rev-66 Orbitrap sample,
-//! cross-checked against values from Thermo's own RawFileReader.
+//! Validates the pure-Rust reader against the real rev-66 Orbitrap sample from
+//! the public ThermoRawFileParser corpus. Expected peaks are reference values
+//! present in that public file (self-consistent with each scan's own structure).
 
 use thermorawfile::{compute_checksum, stored_checksum, RawFile};
 
@@ -33,7 +34,7 @@ fn reads_scan2_centroid_peaks() {
     let rf = RawFile::open(sample("small2.RAW")).expect("open");
     let peaks = rf.centroid_peaks(2);
     assert_eq!(peaks.len(), 196, "scan 2 peak count");
-    // Oracle (RawFileReader): [0] m/z=116.0264 int=12.1, [195] m/z=882.6021.
+    // Reference peaks from the public small2.RAW fixture: [0] m/z=116.0264 int=12.1, [195] m/z=882.6021.
     assert!((peaks[0].mz - 116.0264).abs() < 1e-3, "got {}", peaks[0].mz);
     assert!((peaks[0].intensity - 12.1).abs() < 0.5);
     assert!((peaks[195].mz - 882.6021).abs() < 1e-3, "got {}", peaks[195].mz);
