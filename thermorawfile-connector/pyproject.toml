@@ -11,4 +11,5 @@ license = { text = "MIT OR Apache-2.0" }
 dependencies = ["numpy"]
 
 [tool.maturin]
-module-name = "thermorawfile"
+module-name = "thermorawfile._core"
+python-source = "python"

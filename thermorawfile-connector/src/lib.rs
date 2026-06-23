@@ -187,9 +187,9 @@ fn peak_pairs(
     Ok(mz.iter().zip(inten).map(|(&m, &i)| (m, i)).collect())
 }
 
+/// The compiled extension, imported by the `thermorawfile` Python wrapper as `._core`.
 #[pymodule]
-#[pyo3(name = "thermorawfile")]
-fn thermorawfile_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRawFile>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
