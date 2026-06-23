@@ -1,7 +1,7 @@
 //! Python (PyO3) bindings for thermorawfile. Exposes the pure-Rust reader as
 //! `thermorawfile.RawFile`, with numpy-backed peaks and dict-shaped metadata.
-use numpy::{IntoPyArray, PyArray1};
-use pyo3::exceptions::PyIOError;
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use thermorawfile::generic_record::GenericValue;
@@ -122,6 +122,69 @@ impl PyRawFile {
         }
         Ok(Some(d))
     }
+
+    // --- writer: functional only (no forensic-marker setters — project policy) ---
+
+    /// Replace scan `scan`'s centroid peaks with `(mz: float64[], intensity: float32[])`.
+    /// Arrays must be equal length, with finite positive m/z and non-negative intensity.
+    fn author_centroids(
+        &mut self,
+        scan: u32,
+        mz: PyReadonlyArray1<f64>,
+        intensity: PyReadonlyArray1<f32>,
+    ) -> PyResult<()> {
+        let peaks = peak_pairs(&mz, &intensity)?;
+        self.inner.author_centroids(scan, &peaks).map_err(io_err)
+    }
+
+    /// Merge synthetic peaks onto scan `scan`'s existing centroids (within `merge_tol_ppm`).
+    #[pyo3(signature = (scan, mz, intensity, merge_tol_ppm = 20.0))]
+    fn overlay_centroids(
+        &mut self,
+        scan: u32,
+        mz: PyReadonlyArray1<f64>,
+        intensity: PyReadonlyArray1<f32>,
+        merge_tol_ppm: f64,
+    ) -> PyResult<()> {
+        let peaks = peak_pairs(&mz, &intensity)?;
+        self.inner
+            .overlay_centroids(scan, &peaks, merge_tol_ppm)
+            .map_err(io_err)
+    }
+
+    /// Recompute the integrity checksum and write the (possibly modified) file to `path`.
+    fn save(&mut self, path: String) -> PyResult<()> {
+        self.inner.save(&path).map_err(io_err)
+    }
+}
+
+fn io_err(e: std::io::Error) -> PyErr {
+    PyIOError::new_err(e.to_string())
+}
+
+fn peak_pairs(
+    mz: &PyReadonlyArray1<f64>,
+    intensity: &PyReadonlyArray1<f32>,
+) -> PyResult<Vec<(f64, f32)>> {
+    let mz = mz.as_slice()?;
+    let inten = intensity.as_slice()?;
+    if mz.len() != inten.len() {
+        return Err(PyValueError::new_err(format!(
+            "mz ({}) and intensity ({}) must have the same length",
+            mz.len(),
+            inten.len()
+        )));
+    }
+    if mz
+        .iter()
+        .zip(inten)
+        .any(|(&m, &i)| !m.is_finite() || m <= 0.0 || !i.is_finite() || i < 0.0)
+    {
+        return Err(PyValueError::new_err(
+            "peaks require finite positive m/z and finite non-negative intensity",
+        ));
+    }
+    Ok(mz.iter().zip(inten).map(|(&m, &i)| (m, i)).collect())
 }
 
 #[pymodule]
