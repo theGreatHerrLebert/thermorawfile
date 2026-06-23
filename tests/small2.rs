@@ -66,3 +66,13 @@ fn builds_scan_filter_strings() {
         Some("ITMS + c NSI d w Full ms2 398.54@cid35.00 [95.00-1210.00]")
     );
 }
+
+#[test]
+fn reads_instrument_model_and_acquisition_date() {
+    let rf = RawFile::open(sample("small2.RAW")).expect("open");
+    assert_eq!(rf.instrument_model, Some("LTQ Orbitrap Velos"));
+    assert_eq!(
+        rf.acquired.map(|d| d.to_iso()).as_deref(),
+        Some("2018-04-03 19:15:49")
+    );
+}

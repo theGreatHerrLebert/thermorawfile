@@ -227,6 +227,111 @@ impl Calibration {
     }
 }
 
+/// Acquisition date/time from the RawFileInfo preamble (local time, as recorded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcquisitionDate {
+    pub year: u16,
+    pub month: u16,
+    pub day: u16,
+    pub hour: u16,
+    pub minute: u16,
+    pub second: u16,
+    pub millisecond: u16,
+}
+
+impl AcquisitionDate {
+    fn new(
+        year: u16,
+        month: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        millisecond: u16,
+    ) -> Option<Self> {
+        // A real acquisition has a plausible Y/M/D; otherwise the field is unset/garbage.
+        ((1990..=2100).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day))
+            .then_some(Self { year, month, day, hour, minute, second, millisecond })
+    }
+
+    /// Build from a Unix timestamp (seconds) via Hinnant's civil-from-days algorithm.
+    fn from_unix(secs: f64) -> Option<Self> {
+        if !secs.is_finite() || secs <= 0.0 {
+            return None;
+        }
+        let secs = secs as i64;
+        let days = secs.div_euclid(86_400);
+        let rem = secs.rem_euclid(86_400);
+        let (hour, minute, second) =
+            ((rem / 3600) as u16, ((rem % 3600) / 60) as u16, (rem % 60) as u16);
+        let z = days + 719_468;
+        let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = (doy - (153 * mp + 2) / 5 + 1) as u16;
+        let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u16;
+        let year = (y + i64::from(month <= 2)) as u16;
+        Self::new(year, month, day, hour, minute, second, 0)
+    }
+
+    /// `YYYY-MM-DD HH:MM:SS`.
+    pub fn to_iso(&self) -> String {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            self.year, self.month, self.day, self.hour, self.minute, self.second
+        )
+    }
+}
+
+/// Acquisition date from the FileHeader audit-start tag (a Windows FILETIME at offset 0x28),
+/// the reliable source when the RawFileInfo preamble date is unset (newer firmware).
+fn audit_acquisition_date(bytes: &[u8]) -> Option<AcquisitionDate> {
+    let ft = u64::from_le_bytes(bytes.get(0x28..0x30)?.try_into().ok()?);
+    if ft == 0 {
+        return None;
+    }
+    let unix = (ft as f64 / 10_000_000.0) - 11_644_473_600.0; // FILETIME (100 ns since 1601) → Unix s
+    AcquisitionDate::from_unix(unix)
+}
+
+/// Known Thermo instrument model names, longest-prefix first (so "Orbitrap Fusion Lumos"
+/// matches before "Orbitrap Fusion"). Ported from OpenTFRaw (Apache-2.0).
+const MODEL_REGISTRY: &[&str] = &[
+    "Orbitrap Astral", "Orbitrap Ascend", "Orbitrap Fusion Lumos", "Orbitrap Eclipse",
+    "Orbitrap Fusion", "Orbitrap Exploris 480", "Orbitrap Exploris 240", "Orbitrap Exploris 120",
+    "Orbitrap Exploris MX", "Orbitrap Exploris GC 240", "Orbitrap Exploris", "Q Exactive HF-X",
+    "Q Exactive UHMR", "Q Exactive Plus", "Q Exactive HF", "Q Exactive GC", "Q Exactive Focus",
+    "Q Exactive", "LTQ Orbitrap Velos Pro", "LTQ Orbitrap Velos ETD", "LTQ Orbitrap Velos",
+    "LTQ Orbitrap Elite", "LTQ Orbitrap Discovery", "LTQ Orbitrap XL ETD", "LTQ Orbitrap XL",
+    "LTQ Orbitrap", "Orbitrap Elite", "Orbitrap Velos Pro", "Orbitrap Velos", "Orbitrap Discovery",
+    "Orbitrap XL", "LTQ FT Ultra", "LTQ FT", "LTQ Velos Pro", "LTQ Velos ETD", "LTQ Velos",
+    "LTQ XL ETD", "LTQ XL", "LTQ", "LCQ Fleet", "LCQ Advantage", "LCQ Deca XP Plus", "LCQ Deca XP",
+    "LCQ Deca", "LCQ Classic", "LCQ DUO", "LCQ", "TSQ Quantiva", "TSQ Quantum Ultra AM",
+    "TSQ Quantum Ultra", "TSQ Quantum Access", "TSQ Quantum Discovery", "TSQ Quantum", "TSQ Vantage",
+    "TSQ Endura", "TSQ Altis Plus", "TSQ Altis", "TSQ 8000 Evo", "TSQ 9000", "TSQ",
+];
+
+fn utf16le(s: &str) -> Vec<u8> {
+    s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+/// Detect the instrument model by scanning the file's metadata window (start of file up to
+/// `data_addr`, capped at 64 KiB) for a known model name (UTF-16LE). Ported from OpenTFRaw.
+fn detect_model(bytes: &[u8], data_addr: u64) -> Option<&'static str> {
+    let cap = (64 * 1024).min(data_addr as usize).min(bytes.len());
+    let window = bytes.get(..cap)?;
+    for &name in MODEL_REGISTRY {
+        let needle = utf16le(name);
+        if needle.len() <= window.len() && window.windows(needle.len()).any(|w| w == needle.as_slice()) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 struct MsRunHeader {
     first_scan: u32,
     last_scan: u32,
@@ -273,6 +378,10 @@ pub struct RawFile {
     pub index: Vec<ScanIndexEntry>,
     /// Per-scan trailer parameters (v64+ scan-parameters GenericRecord stream); empty if absent.
     scan_params: Vec<generic_record::GenericRecord>,
+    /// Acquisition date from the RawFileInfo preamble (None if absent/implausible).
+    pub acquired: Option<AcquisitionDate>,
+    /// Instrument model detected from the file's metadata window (None if unrecognized).
+    pub instrument_model: Option<&'static str>,
 }
 
 fn err(msg: &str) -> io::Error {
@@ -351,7 +460,16 @@ impl RawFile {
         c.skip_pascal();
         // RawFileInfo preamble
         c.u32(); // method-file-present
-        c.skip(16); // 8x u16 date
+        let year = c.u16();
+        let month = c.u16();
+        let _day_of_week = c.u16();
+        let day = c.u16();
+        let hour = c.u16();
+        let minute = c.u16();
+        let second = c.u16();
+        let millisecond = c.u16();
+        let acquired = AcquisitionDate::new(year, month, day, hour, minute, second, millisecond)
+            .or_else(|| audit_acquisition_date(&bytes));
         c.u32(); // unknown1
         c.u32(); // data_addr32
         let nctrl = c.u32();
@@ -412,6 +530,7 @@ impl RawFile {
         // Best-effort: per-scan trailer parameters (v64+). Failure → empty, file still opens.
         let scan_params =
             read_scan_params(&bytes, ms.error_log_addr, ms.scantrailer_addr, ms.scanparams_addr, n);
+        let instrument_model = detect_model(&bytes, ms.data_addr);
 
         Ok(RawFile {
             bytes,
@@ -425,6 +544,8 @@ impl RawFile {
             scan_event_size,
             index,
             scan_params,
+            acquired,
+            instrument_model,
         })
     }
 

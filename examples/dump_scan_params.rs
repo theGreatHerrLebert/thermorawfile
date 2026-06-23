@@ -6,6 +6,8 @@ fn main() {
     let a: Vec<String> = std::env::args().collect();
     let rf = RawFile::open(&a[1]).expect("open");
     println!("rev {}  scans {}  first_scan {}", rf.version, rf.scan_count(), rf.first_scan);
+    println!("instrument_model: {:?}", rf.instrument_model);
+    println!("acquired: {:?}", rf.acquired.map(|d| d.to_iso()));
     println!("--- scan filters (first 6) ---");
     for s in rf.first_scan..(rf.first_scan + 6).min(rf.last_scan + 1) {
         println!("    {s}: {:?}", rf.scan_filter(s));
