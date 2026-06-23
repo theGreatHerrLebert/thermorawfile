@@ -25,6 +25,8 @@
 use std::io;
 use std::path::Path;
 
+pub mod generic_record;
+
 /// Size of the fixed file header that precedes the sequencer row.
 pub const FILE_HEADER_SIZE: usize = 1356;
 /// Offset of the 4-byte little-endian Adler-32 checksum inside the file header.
