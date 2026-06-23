@@ -12,3 +12,9 @@ path = "src/main.rs"
 [lib]
 name = "thermorawfile"
 path = "src/lib.rs"
+
+[workspace]
+members = ["thermorawfile-connector"]
+# default to the core crate so `cargo test` / `cargo build` don't pull in the
+# Python extension-module crate; build that explicitly via maturin.
+default-members = ["."]

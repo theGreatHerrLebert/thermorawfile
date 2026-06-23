@@ -1,0 +1,15 @@
+[package]
+name = "thermorawfile-connector"
+version = "0.1.0"
+edition = "2021"
+description = "Python (PyO3) bindings for thermorawfile"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "thermorawfile_connector"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23.3", features = ["extension-module"] }
+numpy = "0.23.0"
+thermorawfile = { path = "..", version = "0.1.0" }

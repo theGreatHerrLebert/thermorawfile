@@ -50,15 +50,42 @@ cargo run --release --bin rawdump -- run.raw 2
   computed over `file[0 : min(len, 10 MiB)]` with that field zeroed, seeded with
   `0` (i.e. `zlib.adler32(buf, 0)`). Thermo's reader rejects any file whose bytes
   don't match — so a writer must recompute it.
-- **Centroid peaks (rev 66):** 12 bytes each — `float64 m/z` followed by
-  `float32 intensity`. (Older revisions use `float32` m/z; `unthermo` assumes the
-  8-byte form, which is why rev-66 peaks decode wrong there.)
+- **Centroid peaks (rev 66):** the record width is **per scan**, read from the
+  packet header — `1+2·n` words → 8-byte (`float32 m/z`, `float32 int`),
+  `1+3·n` words → 12-byte (`float64 m/z`, `float32 int`), `n` = peak count.
+  `unthermo` assumes the 8-byte form, which is why rev-66 wide scans decode wrong
+  there. See `centroid_record_width` and `examples/probe_pkt.rs`.
 
 ## Tests
 
 `cargo test` validates the reader against real sample files in `tests/data/`
 (from the Apache-2.0 [ThermoRawFileParser](https://github.com/compomics/ThermoRawFileParser)
-test corpus), cross-checked against values from Thermo's own `RawFileReader`.
+test corpus): the Adler-32 checksum recomputes to the stored value, and parsed
+peaks are self-consistent with each scan's own structure (record width fixed by
+the packet word count; `float64` m/z in range). `examples/probe_pkt.rs` reproduces
+the width determination on any `.raw`.
+
+## Provenance & reverse engineering
+
+This crate contains **no Thermo SDK, no `RawFileReader` DLL, and no Thermo
+proprietary code**. The `.raw` binary layout is reconstructed entirely from
+clean-room, publicly available sources:
+
+- [`unthermo`](https://bitbucket.org/proteinspector/ms) (Apache-2.0) — structural
+  layout and field names;
+- [`OpenTFRaw`](https://github.com/Sigilweaver/OpenTFRaw) (Apache-2.0) and
+  `unfinnigan` — independent reverse-engineering of the v66 scan-event layout,
+  preamble offsets, and frequency↔m/z calibration, both derived from public
+  PRIDE deposits;
+- the files' own **self-describing structure** — e.g. the centroid record width
+  is fixed *per scan* by the peak-list word count, read from the packet header,
+  not assumed.
+
+The format was **validated against genuine public PRIDE deposits** (e.g. PXD060431
+Orbitrap, PXD061065 Astral): the word count determines the record width per scan
+and the `float64` m/z decode yields monotonic fragment m/z within each scan's own
+bounds. No proprietary software is needed to obtain or verify any of this; the
+determination is reproducible via `examples/probe_pkt.rs`.
 
 ## License
 

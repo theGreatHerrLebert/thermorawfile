@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "thermorawfile"
+version = "0.1.0"
+description = "Pure-Rust reader for Thermo Finnigan .raw files — Python bindings"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+dependencies = ["numpy>=1.21"]  # numpy.typing (NDArray) requires >=1.20
+
+[tool.maturin]
+module-name = "thermorawfile._core"
+python-source = "python"

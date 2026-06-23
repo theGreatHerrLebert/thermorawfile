@@ -1,1 +1,8 @@
 /target
+
+# Python (PyO3 / maturin)
+__pycache__/
+*.pyc
+*.so
+.venv/
+*.egg-info/

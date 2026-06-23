@@ -1,12 +1,22 @@
 //! Pure-Rust reader for Thermo Finnigan `.raw` files (no .NET / RawFileReader DLL).
 //!
-//! Binary layout ported from `unthermo` (Apache-2.0, Pieter Kelchtermans /
-//! proteinspector) and corrected/extended against real rev-66 files using the
-//! Thermo RawFileReader as an oracle. Notable correction vs. unthermo: rev-66
-//! FTMS centroid peaks are `{ f64 m/z, f32 intensity }` (12 bytes), not
-//! `{ f32, f32 }` — *except* the Astral analyzer (ASTMS), whose centroid peaks
-//! are `{ f32 m/z, f32 intensity }` (8 bytes). The width is selected per scan
-//! from the peak-list word count (see [`peak_is_wide`]).
+//! Binary layout reconstructed from clean-room, public-data sources: `unthermo`
+//! (Apache-2.0, Pieter Kelchtermans / proteinspector), `OpenTFRaw` (Apache-2.0,
+//! reverse-engineered from public PRIDE deposits), and `unfinnigan` (Gene Selkov).
+//! The v66 scan-event layout, preamble offsets, and frequency↔m/z calibration all
+//! agree with those public sources. No Thermo SDK, DLL, or proprietary code is
+//! used or linked.
+//!
+//! The centroid record width is not documented by those open sources, but it is
+//! self-describing from the file and was re-derived purely from public data: each
+//! scan's packet header gives the peak-list word count, and `words == 1 + 2*n`
+//! (n peaks) selects the 8-byte `{ f32 m/z, f32 int }` record while `words == 1 + 3*n`
+//! selects the 12-byte `{ f64 m/z, f32 int }` record (see [`centroid_record_width`]).
+//! Validated against genuine public PRIDE deposits — e.g. PXD060431 (Orbitrap) and
+//! PXD061065 (Astral) — where the word count fixes the width per scan and the
+//! f64-m/z interpretation yields monotonic fragment m/z inside each scan's own
+//! bounds. The width is per scan, not per instrument. No RawFileReader, SDK, or
+//! proprietary code is involved.
 //!
 //! Scope of this foundation: structural chain + centroid peak lists + the
 //! Adler-32 integrity checksum, for file revisions >= 64 (Orbitrap-era). Profile
@@ -14,6 +24,8 @@
 
 use std::io;
 use std::path::Path;
+
+pub mod generic_record;
 
 /// Size of the fixed file header that precedes the sequencer row.
 pub const FILE_HEADER_SIZE: usize = 1356;
@@ -141,7 +153,7 @@ pub struct ProfileChunk {
 ///
 /// The profile is sampled on a uniform frequency grid (`f = first_value +
 /// bin·step`, from [`Profile`]); this maps frequency to m/z. Two forms exist,
-/// keyed by `nparam` (decoded against the RawFileReader oracle on rev66):
+/// keyed by `nparam` (per OpenTFRaw §32 / unfinnigan, from public PRIDE data):
 /// `nparam == 4` → `m/z = a + b/f + c/f²`; `nparam ∈ {5, 7}` →
 /// `m/z = a + b/f² + c/f⁴`. The inverse (m/z→frequency) is what lets a writer
 /// place a peak at an arbitrary m/z onto the grid.
@@ -215,18 +227,125 @@ impl Calibration {
     }
 }
 
+/// Acquisition date/time from the RawFileInfo preamble (local time, as recorded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcquisitionDate {
+    pub year: u16,
+    pub month: u16,
+    pub day: u16,
+    pub hour: u16,
+    pub minute: u16,
+    pub second: u16,
+    pub millisecond: u16,
+}
+
+impl AcquisitionDate {
+    fn new(
+        year: u16,
+        month: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        millisecond: u16,
+    ) -> Option<Self> {
+        // A real acquisition has a plausible Y/M/D; otherwise the field is unset/garbage.
+        ((1990..=2100).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day))
+            .then_some(Self { year, month, day, hour, minute, second, millisecond })
+    }
+
+    /// Build from a Unix timestamp (seconds) via Hinnant's civil-from-days algorithm.
+    fn from_unix(secs: f64) -> Option<Self> {
+        if !secs.is_finite() || secs <= 0.0 {
+            return None;
+        }
+        let secs = secs as i64;
+        let days = secs.div_euclid(86_400);
+        let rem = secs.rem_euclid(86_400);
+        let (hour, minute, second) =
+            ((rem / 3600) as u16, ((rem % 3600) / 60) as u16, (rem % 60) as u16);
+        let z = days + 719_468;
+        let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = (doy - (153 * mp + 2) / 5 + 1) as u16;
+        let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u16;
+        let year = (y + i64::from(month <= 2)) as u16;
+        Self::new(year, month, day, hour, minute, second, 0)
+    }
+
+    /// `YYYY-MM-DD HH:MM:SS`.
+    pub fn to_iso(&self) -> String {
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            self.year, self.month, self.day, self.hour, self.minute, self.second
+        )
+    }
+}
+
+/// Acquisition date from the FileHeader audit-start tag (a Windows FILETIME at offset 0x28),
+/// the reliable source when the RawFileInfo preamble date is unset (newer firmware).
+fn audit_acquisition_date(bytes: &[u8]) -> Option<AcquisitionDate> {
+    let ft = u64::from_le_bytes(bytes.get(0x28..0x30)?.try_into().ok()?);
+    if ft == 0 {
+        return None;
+    }
+    let unix = (ft as f64 / 10_000_000.0) - 11_644_473_600.0; // FILETIME (100 ns since 1601) → Unix s
+    AcquisitionDate::from_unix(unix)
+}
+
+/// Known Thermo instrument model names, longest-prefix first (so "Orbitrap Fusion Lumos"
+/// matches before "Orbitrap Fusion"). Ported from OpenTFRaw (Apache-2.0).
+const MODEL_REGISTRY: &[&str] = &[
+    "Orbitrap Astral", "Orbitrap Ascend", "Orbitrap Fusion Lumos", "Orbitrap Eclipse",
+    "Orbitrap Fusion", "Orbitrap Exploris 480", "Orbitrap Exploris 240", "Orbitrap Exploris 120",
+    "Orbitrap Exploris MX", "Orbitrap Exploris GC 240", "Orbitrap Exploris", "Q Exactive HF-X",
+    "Q Exactive UHMR", "Q Exactive Plus", "Q Exactive HF", "Q Exactive GC", "Q Exactive Focus",
+    "Q Exactive", "LTQ Orbitrap Velos Pro", "LTQ Orbitrap Velos ETD", "LTQ Orbitrap Velos",
+    "LTQ Orbitrap Elite", "LTQ Orbitrap Discovery", "LTQ Orbitrap XL ETD", "LTQ Orbitrap XL",
+    "LTQ Orbitrap", "Orbitrap Elite", "Orbitrap Velos Pro", "Orbitrap Velos", "Orbitrap Discovery",
+    "Orbitrap XL", "LTQ FT Ultra", "LTQ FT", "LTQ Velos Pro", "LTQ Velos ETD", "LTQ Velos",
+    "LTQ XL ETD", "LTQ XL", "LTQ", "LCQ Fleet", "LCQ Advantage", "LCQ Deca XP Plus", "LCQ Deca XP",
+    "LCQ Deca", "LCQ Classic", "LCQ DUO", "LCQ", "TSQ Quantiva", "TSQ Quantum Ultra AM",
+    "TSQ Quantum Ultra", "TSQ Quantum Access", "TSQ Quantum Discovery", "TSQ Quantum", "TSQ Vantage",
+    "TSQ Endura", "TSQ Altis Plus", "TSQ Altis", "TSQ 8000 Evo", "TSQ 9000", "TSQ",
+];
+
+fn utf16le(s: &str) -> Vec<u8> {
+    s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+/// Detect the instrument model by scanning the file's metadata window (start of file up to
+/// `data_addr`, capped at 64 KiB) for a known model name (UTF-16LE). Ported from OpenTFRaw.
+fn detect_model(bytes: &[u8], data_addr: u64) -> Option<&'static str> {
+    let cap = (64 * 1024).min(data_addr as usize).min(bytes.len());
+    let window = bytes.get(..cap)?;
+    for &name in MODEL_REGISTRY {
+        let needle = utf16le(name);
+        if needle.len() <= window.len() && window.windows(needle.len()).any(|w| w == needle.as_slice()) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 struct MsRunHeader {
     first_scan: u32,
     last_scan: u32,
     scan_index_addr: u64,
     data_addr: u64,
+    error_log_addr: u64,
     scantrailer_addr: u64,
     scanparams_addr: u64,
 }
 
-// Scan-event field offsets within a fixed-size event record (rev 66), decoded
-// empirically against RawFileReader (unthermo's variable-length v66 layout is
-// wrong). Events are a contiguous fixed-stride array in [scantrailer+4, scanparams).
+// Scan-event field offsets within a fixed-size event record (rev 66), per the
+// OpenTFRaw v66 scan-event layout (§22; 136-byte preamble). unthermo's
+// variable-length v66 layout differs. Events are a contiguous fixed-stride array
+// in [scantrailer+4, scanparams).
 const EV_MS_ORDER: usize = 6; // preamble: 1 = MS1, 2 = MS2
 const EV_ANALYZER: usize = 40; // 0 = ITMS, 4 = FTMS
 const EV_ISO_CENTER: usize = 140; // f64 precursor / isolation-window center m/z
@@ -257,6 +376,12 @@ pub struct RawFile {
     /// Fixed stride of a scan-event record (bytes); 0 if it could not be derived.
     pub scan_event_size: usize,
     pub index: Vec<ScanIndexEntry>,
+    /// Per-scan trailer parameters (v64+ scan-parameters GenericRecord stream); empty if absent.
+    scan_params: Vec<generic_record::GenericRecord>,
+    /// Acquisition date from the RawFileInfo preamble (None if absent/implausible).
+    pub acquired: Option<AcquisitionDate>,
+    /// Instrument model detected from the file's metadata window (None if unrecognized).
+    pub instrument_model: Option<&'static str>,
 }
 
 fn err(msg: &str) -> io::Error {
@@ -335,7 +460,16 @@ impl RawFile {
         c.skip_pascal();
         // RawFileInfo preamble
         c.u32(); // method-file-present
-        c.skip(16); // 8x u16 date
+        let year = c.u16();
+        let month = c.u16();
+        let _day_of_week = c.u16();
+        let day = c.u16();
+        let hour = c.u16();
+        let minute = c.u16();
+        let second = c.u16();
+        let millisecond = c.u16();
+        let acquired = AcquisitionDate::new(year, month, day, hour, minute, second, millisecond)
+            .or_else(|| audit_acquisition_date(&bytes));
         c.u32(); // unknown1
         c.u32(); // data_addr32
         let nctrl = c.u32();
@@ -393,6 +527,11 @@ impl RawFile {
             0
         };
 
+        // Best-effort: per-scan trailer parameters (v64+). Failure → empty, file still opens.
+        let scan_params =
+            read_scan_params(&bytes, ms.error_log_addr, ms.scantrailer_addr, ms.scanparams_addr, n);
+        let instrument_model = detect_model(&bytes, ms.data_addr);
+
         Ok(RawFile {
             bytes,
             version,
@@ -404,11 +543,21 @@ impl RawFile {
             scanparams_addr: ms.scanparams_addr,
             scan_event_size,
             index,
+            scan_params,
+            acquired,
+            instrument_model,
         })
     }
 
     pub fn scan_count(&self) -> usize {
         self.index.len()
+    }
+
+    /// Per-scan trailer parameters (AGC, ion-injection time, charge, FAIMS, NCE, ...) from
+    /// the v64+ scan-parameters stream. `None` if the stream was absent or `scan` is out of range.
+    pub fn scan_params(&self, scan: u32) -> Option<ScanParams<'_>> {
+        let idx = scan.checked_sub(self.first_scan)? as usize;
+        self.scan_params.get(idx).map(ScanParams)
     }
 
     /// Read the centroid peak list for `scan` (1-based). Returns an empty vec for
@@ -491,28 +640,58 @@ impl RawFile {
 
     /// Read the FTMS frequency↔m/z calibration from a scan-event byte offset.
     ///
-    /// rev66 MS1 scan-event layout (decoded against the RawFileReader oracle):
+    /// rev66 MS1 scan-event layout (per OpenTFRaw §22 / unfinnigan, public-data RE):
     /// `Nparam u32 @ +216`, then `A/B/C f64 @ +236 / +244 / +252`. Returns
     /// `None` if `nparam` is not a recognised value (4/5/7) — e.g. a non-MS1
     /// event. Locating the event offset for an arbitrary scan needs the
     /// variable-length scan-event walk (MS1 events are longer than MS2); for
     /// the first scan the offset is `scantrailer_addr + 4`.
     pub fn calibration_at_event(&self, event_offset: usize) -> Option<Calibration> {
-        let o = event_offset;
-        if o + 260 > self.bytes.len() {
-            return None;
+        // The calibration record — nparam (u32) followed by a@+20, b@+28, c@+36 (f64) — sits
+        // at a revision-dependent offset within the trailer event: Astral at +216 (nparam=5),
+        // Exploris/Q-Exactive at +160 (nparam=7). Try those two KNOWN offsets first so an
+        // accidental earlier byte pattern can't mask the real record; only then fall back to
+        // scanning the event for the first plausible record (handles unknown revisions).
+        let base = event_offset;
+        let plausible = |o: usize| -> Option<Calibration> {
+            if o + 44 > self.bytes.len() {
+                return None;
+            }
+            let nparam = u32::from_le_bytes(self.bytes[o..o + 4].try_into().unwrap());
+            if !matches!(nparam, 4 | 5 | 7) {
+                return None;
+            }
+            let rd = |k: usize| f64::from_le_bytes(self.bytes[o + k..o + k + 8].try_into().unwrap());
+            let (a, b, c) = (rd(20), rd(28), rd(36));
+            if a.is_finite()
+                && b.is_finite()
+                && c.is_finite()
+                && a.abs() < 1e6
+                && b.abs() > 1.0
+                && b.abs() < 1e15
+                && c.abs() < 1e18
+            {
+                Some(Calibration { nparam, a, b, c })
+            } else {
+                None
+            }
+        };
+        // Known revision offsets first.
+        for known in [216usize, 160] {
+            if let Some(cal) = plausible(base + known) {
+                return Some(cal);
+            }
         }
-        let nparam = u32::from_le_bytes(self.bytes[o + 216..o + 220].try_into().unwrap());
-        if !matches!(nparam, 4 | 5 | 7) {
-            return None;
+        // Fallback: scan the event for the first plausible record.
+        let limit = (base + 4096).min(self.bytes.len());
+        let mut o = base;
+        while o + 44 <= limit {
+            if let Some(cal) = plausible(o) {
+                return Some(cal);
+            }
+            o += 4;
         }
-        let rd = |k: usize| f64::from_le_bytes(self.bytes[o + k..o + k + 8].try_into().unwrap());
-        Some(Calibration {
-            nparam,
-            a: rd(236),
-            b: rd(244),
-            c: rd(252),
-        })
+        None
     }
 
     /// The checksum stored in the file header.
@@ -1403,6 +1582,89 @@ impl RawFile {
         })
     }
 
+    /// Construct the human-readable scan filter line from the scan-event preamble,
+    /// e.g. `FTMS + c NSI d Full ms2 542.30@hcd35.00 [100.00-1600.00]`. `None` if the
+    /// scan or its event record is out of range. Preamble field codes follow OpenTFRaw §22.
+    pub fn scan_filter(&self, scan: u32) -> Option<String> {
+        let o = self.scan_event_offset(scan)?;
+        let byte = |off: usize| self.bytes.get(o + off).copied();
+        let f64at = |off: usize| -> Option<f64> {
+            self.bytes
+                .get(o + off..o + off + 8)
+                .map(|s| f64::from_le_bytes(s.try_into().unwrap()))
+        };
+        let analyzer = match byte(EV_ANALYZER)? {
+            0 => "ITMS",
+            1 => "TQMS",
+            2 => "SQMS",
+            3 => "TOFMS",
+            4 => "FTMS",
+            5 => "Sector",
+            _ => "",
+        };
+        let polarity = match byte(4)? {
+            0 => "-",
+            1 => "+",
+            _ => "",
+        };
+        let scan_mode = match byte(5)? {
+            0 => "c",
+            1 => "p",
+            _ => "",
+        };
+        let ms_power = byte(EV_MS_ORDER)?;
+        let scan_type = match byte(7)? {
+            0 => "Full",
+            1 => "Z",
+            2 => "SIM",
+            3 => "SRM",
+            4 => "CRM",
+            6 => "Q1",
+            7 => "Q3",
+            _ => "",
+        };
+        let ionization = match byte(11)? {
+            0 => "EI",
+            1 => "CI",
+            2 => "FAB",
+            3 => "ESI",
+            4 => "APCI",
+            5 => "NSI",
+            6 => "TSI",
+            7 => "FD",
+            8 => "MALDI",
+            9 => "GD",
+            _ => "",
+        };
+        let mut parts: Vec<String> = [analyzer, polarity, scan_mode, ionization]
+            .into_iter()
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        if byte(10)? == 1 {
+            parts.push("d".into());
+        }
+        if byte(32)? == 1 {
+            parts.push("w".into());
+        }
+        if !scan_type.is_empty() {
+            parts.push(scan_type.into());
+        }
+        parts.push(if ms_power <= 1 { "ms".into() } else { format!("ms{ms_power}") });
+        if ms_power >= 2 {
+            let act = match byte(24)? {
+                1 => "hcd",
+                4 => "cid",
+                _ => "",
+            };
+            let center = f64at(EV_ISO_CENTER).unwrap_or(0.0);
+            let energy = f64at(EV_COLLISION_ENERGY).unwrap_or(0.0);
+            parts.push(format!("{center:.2}@{act}{energy:.2}"));
+        }
+        let entry = self.index.get(scan.checked_sub(self.first_scan)? as usize)?;
+        Some(format!("{} [{:.2}-{:.2}]", parts.join(" "), entry.low_mz, entry.high_mz))
+    }
+
     /// Author an MS2 isolation window: set the precursor / window-center m/z,
     /// isolation width, and collision energy for `scan`. Call [`RawFile::save`]
     /// afterwards to fix the checksum.
@@ -1441,7 +1703,7 @@ fn read_runheader(b: &[u8], addr: usize) -> MsRunHeader {
     let scan_index_addr = c.u64();
     let data_addr = c.u64();
     c.u64(); // InstlogAddr
-    c.u64(); // ErrorlogAddr
+    let error_log_addr = c.u64();
     c.u64(); // Unknown9
     let scantrailer_addr = c.u64();
     let scanparams_addr = c.u64();
@@ -1450,8 +1712,102 @@ fn read_runheader(b: &[u8], addr: usize) -> MsRunHeader {
         last_scan,
         scan_index_addr,
         data_addr,
+        error_log_addr,
         scantrailer_addr,
         scanparams_addr,
+    }
+}
+
+/// Best-effort decode of the v64+ per-scan trailer-parameters stream: locate the schema
+/// (GenericDataHeader) in `[error_log_addr, scantrailer_addr)` by signature + expected record
+/// size, then read one fixed-stride record per scan from `scanparams_addr`. Any failure (no
+/// schema, truncation, malformed) yields an empty vec — the file still opens.
+fn read_scan_params(
+    bytes: &[u8],
+    error_log_addr: u64,
+    scantrailer_addr: u64,
+    scanparams_addr: u64,
+    num_scans: usize,
+) -> Vec<generic_record::GenericRecord> {
+    use generic_record::{GenericDataHeader, GenericRecord, SliceReader};
+    let start = error_log_addr as usize;
+    let trailer = scantrailer_addr as usize;
+    let params = scanparams_addr as usize;
+    if num_scans == 0 || start == 0 || start >= trailer || trailer > bytes.len() || params >= bytes.len() {
+        return Vec::new();
+    }
+    let expected = {
+        let tail = bytes.len().saturating_sub(params);
+        let per = tail / num_scans;
+        (per >= 4).then_some(per)
+    };
+    let scan_distance = trailer - start;
+    let mut r = SliceReader::new(bytes);
+    (|| -> io::Result<Vec<GenericRecord>> {
+        r.seek_to(start)?;
+        let hdr = match GenericDataHeader::find_forward(&mut r, scan_distance, expected)? {
+            Some(h) => h,
+            None => return Ok(Vec::new()),
+        };
+        r.seek_to(params)?;
+        let mut out = Vec::with_capacity(num_scans);
+        for _ in 0..num_scans {
+            out.push(GenericRecord::read(&mut r, &hdr)?);
+        }
+        Ok(out)
+    })()
+    .unwrap_or_default()
+}
+
+/// Typed, label-driven view over one scan's trailer record. Labels vary by instrument and
+/// firmware, so each accessor returns `Option` and tries known variants. Label→field mappings
+/// mirror OpenTFRaw's `ScanParams` (Apache-2.0). The underlying [`generic_record::GenericRecord`]
+/// is available via [`ScanParams::record`] for any label not covered here.
+pub struct ScanParams<'a>(&'a generic_record::GenericRecord);
+
+impl<'a> ScanParams<'a> {
+    /// The raw decoded record (query arbitrary labels via its `get_*` methods).
+    pub fn record(&self) -> &'a generic_record::GenericRecord {
+        self.0
+    }
+    pub fn ion_injection_time_ms(&self) -> Option<f64> {
+        self.0
+            .get_f64("Ion Injection Time (ms):")
+            .or_else(|| self.0.get_f64("Ion Inject Time (ms):"))
+    }
+    pub fn charge_state(&self) -> Option<i32> {
+        self.0.get_i32("Charge State:")
+    }
+    pub fn monoisotopic_mz(&self) -> Option<f64> {
+        self.0
+            .get_f64("Monoisotopic M/Z:")
+            .or_else(|| self.0.get_f64("MS2 Isolation M/Z:"))
+            .or_else(|| self.0.get_f64("Isolation Center M/Z:"))
+            .or_else(|| self.0.get_f64("Precursor M/Z:"))
+    }
+    pub fn agc_target(&self) -> Option<i32> {
+        self.0.get_i32("AGC Target:")
+    }
+    pub fn micro_scan_count(&self) -> Option<i32> {
+        self.0.get_i32("Micro Scan Count:")
+    }
+    pub fn master_scan_number(&self) -> Option<i32> {
+        self.0
+            .get_i32("Master Scan Number:")
+            .or_else(|| self.0.get_i32("Master Index:"))
+    }
+    pub fn elapsed_scan_time_s(&self) -> Option<f64> {
+        self.0.get_f64("Elapsed Scan Time (sec):")
+    }
+    pub fn max_ion_time_ms(&self) -> Option<f64> {
+        self.0.get_f64("Max. Ion Time (ms):")
+    }
+    pub fn isolation_width_mz(&self) -> Option<f64> {
+        self.0
+            .get_f64("MS2 Isolation Width:")
+            .or_else(|| self.0.get_f64("MSn Isolation Width:"))
+            .or_else(|| self.0.get_f64("Isolation Width (M/Z):"))
+            .or_else(|| self.0.get_f64("MS2 Isolation Width (M/Z):"))
     }
 }
 
@@ -1492,6 +1848,169 @@ fn adler32_seed0(data: &[u8]) -> u32 {
     (b << 16) | a
 }
 
+// ---------------------------------------------------------------------------
+// Robustness guards. Every Thermo failure we hit was a *silent* mis-read or
+// mis-write that round-tripped through our own code (an Exploris run decoded as
+// all-MS1; authored peaks that read back wrong). These check parse/author output
+// against independent invariants instead of trusting self-consistency.
+// ---------------------------------------------------------------------------
+
+/// Result of [`RawFile::scan_event_consistency`] — a parse-level scan-event probe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanEventConsistency {
+    /// Scans whose event parsed.
+    pub n_checked: u32,
+    /// MS1 (`ms_order <= 1`) scans seen.
+    pub n_ms1: u32,
+    /// MSn (`ms_order >= 2`) scans seen.
+    pub n_msn: u32,
+    /// Scans whose level <-> isolation relationship is contradictory.
+    pub n_inconsistent: u32,
+    /// Scans in range whose event could not be parsed.
+    pub n_unparsed: u32,
+}
+
+impl ScanEventConsistency {
+    /// Whether the scan-event levels look reliably decoded: at least one scan
+    /// checked, no MSn-without-isolation contradictions, and both MS1 and MSn
+    /// present. A `false` is a *gross* mis-read signature (e.g. a run decoded as
+    /// all-MS1, or MSn scans missing their isolation window).
+    ///
+    /// LIMITATION: this is a cheap smoke test, not a complete validator. A *subtle*
+    /// partial level-swap (some MS2 mislabeled MS1 but still carrying a plausible
+    /// isolation field) satisfies these invariants and passes — catching that needs
+    /// an external reference (a different parser), not self-consistency.
+    pub fn looks_consistent(&self) -> bool {
+        self.n_checked > 0 && self.n_inconsistent == 0 && self.n_ms1 > 0 && self.n_msn > 0
+    }
+}
+
+/// Pure comparison core for [`RawFile::verify_centroids`] — split out so the
+/// round-trip tolerance logic is unit-testable without a file. Compares two
+/// centroid lists as m/z-sorted sets (the stored order is m/z-ascending,
+/// independent of author order). `Ok` iff equal length and every peak matches
+/// within `mz_tol_ppm` (floored at 1e-4 Th) and a small relative+absolute
+/// intensity tolerance.
+fn compare_centroids(got: &[(f64, f32)], want: &[(f64, f32)], mz_tol_ppm: f64) -> Result<(), String> {
+    if !mz_tol_ppm.is_finite() || mz_tol_ppm < 0.0 {
+        return Err(format!("invalid m/z tolerance {} ppm", mz_tol_ppm));
+    }
+    if got.len() != want.len() {
+        return Err(format!("read back {} centroids, authored {}", got.len(), want.len()));
+    }
+    // Reject non-finite values up front: a NaN m/z or intensity would otherwise slip
+    // through every `>` comparison (NaN comparisons are false) and pass silently.
+    for (label, list) in [("read-back", got), ("authored", want)] {
+        for (i, p) in list.iter().enumerate() {
+            if !p.0.is_finite() || !p.1.is_finite() {
+                return Err(format!("{} peak {}: non-finite m/z {} / intensity {}", label, i, p.0, p.1));
+            }
+        }
+    }
+    // Sort by (m/z, intensity) — the intensity tie-break makes the pairwise match
+    // deterministic when two peaks share an m/z (otherwise sort order, hence the
+    // verdict, would depend on input order). Non-finite already rejected, so unwrap is safe.
+    let key = |a: &&(f64, f32), b: &&(f64, f32)| {
+        a.0.partial_cmp(&b.0).unwrap().then(a.1.partial_cmp(&b.1).unwrap())
+    };
+    let mut g: Vec<&(f64, f32)> = got.iter().collect();
+    let mut w: Vec<&(f64, f32)> = want.iter().collect();
+    g.sort_by(key);
+    w.sort_by(key);
+    for (i, (gp, wp)) in g.iter().zip(w.iter()).enumerate() {
+        let mz_tol = (wp.0 * mz_tol_ppm * 1e-6).max(1e-4);
+        if (gp.0 - wp.0).abs() > mz_tol {
+            return Err(format!(
+                "peak {}: m/z read back {:.5} != authored {:.5} (tol {:.4} Th)",
+                i, gp.0, wp.0, mz_tol
+            ));
+        }
+        let int_tol = wp.1.abs() * 1e-3 + 1e-3;
+        if (gp.1 - wp.1).abs() > int_tol {
+            return Err(format!(
+                "peak {}: intensity read back {} != authored {}",
+                i, gp.1, wp.1
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl RawFile {
+    /// Robustness (reader): scan-event level/isolation self-consistency over the
+    /// first `k` scans (clamped to the file). Two parse-level invariants a correctly
+    /// decoded file satisfies: every MSn scan carries an isolation window, and both
+    /// MS1 and MSn levels are present. A violation (e.g. a run decoded as all-MS1, or
+    /// MSn scans missing their isolation window) means the scan-event preamble was
+    /// mis-decoded for this file's revision (the silent Exploris-class mis-read). We
+    /// deliberately do NOT assume MS1 lacks an isolation field — real MS1 events carry
+    /// a non-zero center, so that direction false-positives. Parse-level only: no
+    /// DIA/DDA or "useful template" judgement; that belongs to the consumer.
+    pub fn scan_event_consistency(&self, k: u32) -> ScanEventConsistency {
+        let mut c = ScanEventConsistency::default();
+        if k == 0 || self.last_scan < self.first_scan {
+            return c;
+        }
+        let span = self.last_scan - self.first_scan + 1;
+        let n = k.min(span);
+        for s in self.first_scan..(self.first_scan + n) {
+            let ev = match self.scan_event(s) {
+                Some(e) => e,
+                None => {
+                    c.n_unparsed += 1;
+                    continue;
+                }
+            };
+            c.n_checked += 1;
+            let has_iso = ev.isolation_center > 0.0 && ev.isolation_width > 0.0;
+            if ev.ms_order <= 1 {
+                // NB: a survey MS1's isolation field is NOT reliably zero across
+                // instruments — real MS1 events carry a non-zero center — so we do
+                // not flag "MS1 with isolation" (it false-positives on valid files).
+                c.n_ms1 += 1;
+            } else {
+                c.n_msn += 1;
+                if !has_iso {
+                    c.n_inconsistent += 1; // an MSn without an isolation window is mis-decoded
+                }
+            }
+        }
+        c
+    }
+
+    /// Robustness (writer): re-read `scan`'s centroids from the (just-authored)
+    /// in-memory bytes and verify they round-trip to `expected` within tolerance —
+    /// catching an authoring/encoding bug at write time instead of in a downstream
+    /// search. Order-independent (compares m/z-sorted sets).
+    pub fn verify_centroids(
+        &self,
+        scan: u32,
+        expected: &[(f64, f32)],
+        mz_tol_ppm: f64,
+    ) -> io::Result<()> {
+        let got: Vec<(f64, f32)> = self
+            .centroid_peaks(scan)
+            .iter()
+            .map(|p| (p.mz, p.intensity))
+            .collect();
+        compare_centroids(&got, expected, mz_tol_ppm)
+            .map_err(|m| err(&format!("write read-back failed for scan {}: {}", scan, m)))
+    }
+
+    /// Like [`RawFile::author_centroids`], but immediately verifies the round-trip:
+    /// the authored peaks must read back within `mz_tol_ppm` / intensity tolerance,
+    /// or the call errors instead of silently emitting a malformed scan.
+    pub fn author_centroids_verified(
+        &mut self,
+        scan: u32,
+        peaks: &[(f64, f32)],
+        mz_tol_ppm: f64,
+    ) -> io::Result<()> {
+        self.author_centroids(scan, peaks)?;
+        self.verify_centroids(scan, peaks, mz_tol_ppm)
+    }
+}
+
 #[cfg(test)]
 mod centroid_width_tests {
     use super::{centroid_record_width, peak_is_wide};
@@ -1520,5 +2039,92 @@ mod centroid_width_tests {
         assert!(!peak_is_wide(1 + 2 * 100, 100)); // narrow
         assert!(peak_is_wide(1 + 3 * 100, 100)); // wide
         assert!(!peak_is_wide(1 + 2 * 100 + 3, 100)); // ambiguous -> narrow (lenient read)
+    }
+}
+
+#[cfg(test)]
+mod robustness_tests {
+    use super::{compare_centroids, ScanEventConsistency};
+
+    #[test]
+    fn compare_centroids_matches_sorted_sets() {
+        // author order differs from stored (m/z-ascending) order -> still matches
+        let want = [(500.25_f64, 10.0_f32), (175.12, 100.0), (300.50, 50.0)];
+        let got = [(175.12_f64, 100.0_f32), (300.50, 50.0), (500.25, 10.0)];
+        assert!(compare_centroids(&got, &want, 5.0).is_ok());
+    }
+
+    #[test]
+    fn compare_centroids_rejects_count_mismatch() {
+        let want = [(175.12_f64, 100.0_f32), (300.50, 50.0)];
+        let got = [(175.12_f64, 100.0_f32)];
+        assert!(compare_centroids(&got, &want, 5.0).is_err());
+    }
+
+    #[test]
+    fn compare_centroids_mz_tolerance() {
+        let want = [(500.000_f64, 10.0_f32)];
+        assert!(compare_centroids(&[(500.0100, 10.0)], &want, 5.0).is_err()); // ~20 ppm: reject
+        assert!(compare_centroids(&[(500.0010, 10.0)], &want, 5.0).is_ok()); //  ~2 ppm: accept
+    }
+
+    #[test]
+    fn compare_centroids_rejects_intensity_drift() {
+        let want = [(500.0_f64, 100.0_f32)];
+        assert!(compare_centroids(&[(500.0, 150.0)], &want, 5.0).is_err());
+    }
+
+    #[test]
+    fn compare_centroids_rejects_non_finite() {
+        // NaN/inf must NOT slip through (a `>` comparison against NaN is false).
+        let want = [(500.0_f64, 100.0_f32)];
+        assert!(compare_centroids(&[(f64::NAN, 100.0)], &want, 5.0).is_err());
+        assert!(compare_centroids(&[(500.0, f32::INFINITY)], &want, 5.0).is_err());
+    }
+
+    #[test]
+    fn compare_centroids_rejects_bad_tolerance() {
+        let want = [(500.0_f64, 100.0_f32)];
+        assert!(compare_centroids(&[(500.0, 100.0)], &want, f64::NAN).is_err());
+        assert!(compare_centroids(&[(500.0, 100.0)], &want, -5.0).is_err());
+    }
+
+    #[test]
+    fn compare_centroids_handles_duplicate_mz_by_intensity_tiebreak() {
+        // two peaks at the same m/z, different intensities, given in opposite orders
+        let want = [(500.0_f64, 10.0_f32), (500.0, 90.0)];
+        let got = [(500.0_f64, 90.0_f32), (500.0, 10.0)];
+        assert!(compare_centroids(&got, &want, 5.0).is_ok());
+        // genuinely different intensities at the shared m/z must still fail
+        let bad = [(500.0_f64, 90.0_f32), (500.0, 11.0)];
+        assert!(compare_centroids(&bad, &want, 5.0).is_err());
+    }
+
+    #[test]
+    fn scan_event_consistency_verdict() {
+        type S = ScanEventConsistency;
+        let ok = S { n_checked: 10, n_ms1: 1, n_msn: 9, n_inconsistent: 0, n_unparsed: 0 };
+        assert!(ok.looks_consistent());
+        // all-MS1 (no MSn) -> the Exploris mis-read signature
+        let all_ms1 = S { n_checked: 10, n_ms1: 10, n_msn: 0, n_inconsistent: 0, n_unparsed: 0 };
+        assert!(!all_ms1.looks_consistent());
+        // a level<->isolation contradiction
+        let contra = S { n_checked: 10, n_ms1: 1, n_msn: 9, n_inconsistent: 3, n_unparsed: 0 };
+        assert!(!contra.looks_consistent());
+        // nothing parsed
+        assert!(!S::default().looks_consistent());
+    }
+
+    #[test]
+    fn scan_event_consistency_on_real_fixture() {
+        // Opt-in: set THERMORAWFILE_TEST_RAW to a known-good DIA .raw to exercise the
+        // reader-side probe end to end. Skipped when unset (CI has no vendor fixtures).
+        let path = match std::env::var("THERMORAWFILE_TEST_RAW") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let rf = super::RawFile::open(&path).expect("open fixture");
+        let c = rf.scan_event_consistency(2000);
+        assert!(c.looks_consistent(), "fixture scan-events look mis-decoded: {:?}", c);
     }
 }

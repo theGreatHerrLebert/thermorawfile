@@ -1,5 +1,6 @@
-//! Validates the pure-Rust reader against the real rev-66 Orbitrap sample,
-//! cross-checked against values from Thermo's own RawFileReader.
+//! Validates the pure-Rust reader against the real rev-66 Orbitrap sample from
+//! the public ThermoRawFileParser corpus. Expected peaks are reference values
+//! present in that public file (self-consistent with each scan's own structure).
 
 use thermorawfile::{compute_checksum, stored_checksum, RawFile};
 
@@ -33,8 +34,45 @@ fn reads_scan2_centroid_peaks() {
     let rf = RawFile::open(sample("small2.RAW")).expect("open");
     let peaks = rf.centroid_peaks(2);
     assert_eq!(peaks.len(), 196, "scan 2 peak count");
-    // Oracle (RawFileReader): [0] m/z=116.0264 int=12.1, [195] m/z=882.6021.
+    // Reference peaks from the public small2.RAW fixture: [0] m/z=116.0264 int=12.1, [195] m/z=882.6021.
     assert!((peaks[0].mz - 116.0264).abs() < 1e-3, "got {}", peaks[0].mz);
     assert!((peaks[0].intensity - 12.1).abs() < 0.5);
     assert!((peaks[195].mz - 882.6021).abs() < 1e-3, "got {}", peaks[195].mz);
+}
+
+#[test]
+fn reads_scan2_trailer_params() {
+    let rf = RawFile::open(sample("small2.RAW")).expect("open");
+    let p = rf.scan_params(2).expect("scan 2 trailer params");
+    assert_eq!(p.charge_state(), Some(3));
+    assert_eq!(p.ion_injection_time_ms(), Some(50.0));
+    // cross-check: the trailer's monoisotopic m/z equals the scan-2 precursor center.
+    assert!((p.monoisotopic_mz().unwrap() - 398.5411).abs() < 1e-3);
+    assert_eq!(p.isolation_width_mz(), Some(2.0));
+    assert_eq!(p.micro_scan_count(), Some(1));
+    // the underlying record exposes every label, not just the typed accessors
+    assert!(p.record().get("FT Resolution:").is_some());
+}
+
+#[test]
+fn builds_scan_filter_strings() {
+    let rf = RawFile::open(sample("small2.RAW")).expect("open");
+    assert_eq!(
+        rf.scan_filter(1).as_deref(),
+        Some("FTMS + p NSI Full ms [350.00-1200.00]")
+    );
+    assert_eq!(
+        rf.scan_filter(2).as_deref(),
+        Some("ITMS + c NSI d w Full ms2 398.54@cid35.00 [95.00-1210.00]")
+    );
+}
+
+#[test]
+fn reads_instrument_model_and_acquisition_date() {
+    let rf = RawFile::open(sample("small2.RAW")).expect("open");
+    assert_eq!(rf.instrument_model, Some("LTQ Orbitrap Velos"));
+    assert_eq!(
+        rf.acquired.map(|d| d.to_iso()).as_deref(),
+        Some("2018-04-03 19:15:49")
+    );
 }
