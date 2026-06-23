@@ -1461,6 +1461,89 @@ impl RawFile {
         })
     }
 
+    /// Construct the human-readable scan filter line from the scan-event preamble,
+    /// e.g. `FTMS + c NSI d Full ms2 542.30@hcd35.00 [100.00-1600.00]`. `None` if the
+    /// scan or its event record is out of range. Preamble field codes follow OpenTFRaw §22.
+    pub fn scan_filter(&self, scan: u32) -> Option<String> {
+        let o = self.scan_event_offset(scan)?;
+        let byte = |off: usize| self.bytes.get(o + off).copied();
+        let f64at = |off: usize| -> Option<f64> {
+            self.bytes
+                .get(o + off..o + off + 8)
+                .map(|s| f64::from_le_bytes(s.try_into().unwrap()))
+        };
+        let analyzer = match byte(EV_ANALYZER)? {
+            0 => "ITMS",
+            1 => "TQMS",
+            2 => "SQMS",
+            3 => "TOFMS",
+            4 => "FTMS",
+            5 => "Sector",
+            _ => "",
+        };
+        let polarity = match byte(4)? {
+            0 => "-",
+            1 => "+",
+            _ => "",
+        };
+        let scan_mode = match byte(5)? {
+            0 => "c",
+            1 => "p",
+            _ => "",
+        };
+        let ms_power = byte(EV_MS_ORDER)?;
+        let scan_type = match byte(7)? {
+            0 => "Full",
+            1 => "Z",
+            2 => "SIM",
+            3 => "SRM",
+            4 => "CRM",
+            6 => "Q1",
+            7 => "Q3",
+            _ => "",
+        };
+        let ionization = match byte(11)? {
+            0 => "EI",
+            1 => "CI",
+            2 => "FAB",
+            3 => "ESI",
+            4 => "APCI",
+            5 => "NSI",
+            6 => "TSI",
+            7 => "FD",
+            8 => "MALDI",
+            9 => "GD",
+            _ => "",
+        };
+        let mut parts: Vec<String> = [analyzer, polarity, scan_mode, ionization]
+            .into_iter()
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        if byte(10)? == 1 {
+            parts.push("d".into());
+        }
+        if byte(32)? == 1 {
+            parts.push("w".into());
+        }
+        if !scan_type.is_empty() {
+            parts.push(scan_type.into());
+        }
+        parts.push(if ms_power <= 1 { "ms".into() } else { format!("ms{ms_power}") });
+        if ms_power >= 2 {
+            let act = match byte(24)? {
+                1 => "hcd",
+                4 => "cid",
+                _ => "",
+            };
+            let center = f64at(EV_ISO_CENTER).unwrap_or(0.0);
+            let energy = f64at(EV_COLLISION_ENERGY).unwrap_or(0.0);
+            parts.push(format!("{center:.2}@{act}{energy:.2}"));
+        }
+        let entry = self.index.get(scan.checked_sub(self.first_scan)? as usize)?;
+        Some(format!("{} [{:.2}-{:.2}]", parts.join(" "), entry.low_mz, entry.high_mz))
+    }
+
     /// Author an MS2 isolation window: set the precursor / window-center m/z,
     /// isolation width, and collision energy for `scan`. Call [`RawFile::save`]
     /// afterwards to fix the checksum.

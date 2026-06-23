@@ -53,3 +53,16 @@ fn reads_scan2_trailer_params() {
     // the underlying record exposes every label, not just the typed accessors
     assert!(p.record().get("FT Resolution:").is_some());
 }
+
+#[test]
+fn builds_scan_filter_strings() {
+    let rf = RawFile::open(sample("small2.RAW")).expect("open");
+    assert_eq!(
+        rf.scan_filter(1).as_deref(),
+        Some("FTMS + p NSI Full ms [350.00-1200.00]")
+    );
+    assert_eq!(
+        rf.scan_filter(2).as_deref(),
+        Some("ITMS + c NSI d w Full ms2 398.54@cid35.00 [95.00-1210.00]")
+    );
+}
