@@ -223,7 +223,9 @@ impl GenericDataHeader {
         self.fields
             .iter()
             .map(|f| match f.field_type {
-                GenericType::Gap => 0,
+                // Gap = padding of `length` bytes (OpenTFRaw treats it as 0-width, which
+                // misaligns any schema with a non-zero-length gap — codex review).
+                GenericType::Gap => f.length as usize,
                 GenericType::Int8
                 | GenericType::Bool
                 | GenericType::BoolYesNo
@@ -320,7 +322,10 @@ impl GenericRecord {
         let mut values = Vec::with_capacity(header.fields.len());
         for desc in &header.fields {
             let value = match desc.field_type {
-                GenericType::Gap => GenericValue::Gap,
+                GenericType::Gap => {
+                    let _ = r.read_bytes(desc.length as usize)?; // consume the padding
+                    GenericValue::Gap
+                }
                 GenericType::Int8 => GenericValue::Int8(r.read_i8()?),
                 GenericType::Bool | GenericType::BoolYesNo | GenericType::BoolOnOff => {
                     GenericValue::Bool(r.read_u8()? != 0)
@@ -370,6 +375,7 @@ impl GenericRecord {
             GenericValue::Int8(v) => Some(*v as i32),
             GenericValue::UInt32(v) => i32::try_from(*v).ok(),
             GenericValue::UInt16(v) => Some(*v as i32),
+            GenericValue::UInt8(v) => Some(*v as i32),
             _ => None,
         }
     }
@@ -453,5 +459,37 @@ mod tests {
         let bytes = [0x02u8, 0x00]; // claims a field count but is truncated
         let mut r = SliceReader::new(&bytes);
         assert!(r.read_u32().is_err());
+    }
+
+    #[test]
+    fn gap_with_length_is_consumed() {
+        let mut hdr = 3u32.to_le_bytes().to_vec();
+        hdr.extend(field(0xB, 0, "A:")); // Float64
+        hdr.extend(field(0x0, 4, "g:")); // Gap, 4 bytes
+        hdr.extend(field(0x8, 0, "B:")); // Int32
+        let mut r = SliceReader::new(&hdr);
+        let header = GenericDataHeader::try_read(&mut r).unwrap().expect("valid header");
+        assert_eq!(header.fixed_record_size(), 8 + 4 + 4);
+
+        let mut rec = 1.5f64.to_le_bytes().to_vec();
+        rec.extend_from_slice(&[0xFF; 4]); // gap padding
+        rec.extend_from_slice(&7i32.to_le_bytes());
+        let mut rr = SliceReader::new(&rec);
+        let record = GenericRecord::read(&mut rr, &header).unwrap();
+        assert_eq!(record.get_f64("A:"), Some(1.5));
+        assert_eq!(record.get_i32("B:"), Some(7)); // 0xFFFFFFFF garbage if the gap is not skipped
+    }
+
+    #[test]
+    fn get_i32_reads_uint8() {
+        let mut hdr = 2u32.to_le_bytes().to_vec();
+        hdr.extend(field(0x5, 0, "Charge:")); // UInt8
+        hdr.extend(field(0x5, 0, "N:")); // UInt8
+        let mut r = SliceReader::new(&hdr);
+        let header = GenericDataHeader::try_read(&mut r).unwrap().expect("valid header");
+        let mut rr = SliceReader::new(&[4u8, 9u8]);
+        let rec = GenericRecord::read(&mut rr, &header).unwrap();
+        assert_eq!(rec.get_i32("Charge:"), Some(4));
+        assert_eq!(rec.get_i32("N:"), Some(9));
     }
 }
