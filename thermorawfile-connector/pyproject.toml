@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Pure-Rust reader for Thermo Finnigan .raw files — Python bindings"
 requires-python = ">=3.9"
 license = { text = "MIT OR Apache-2.0" }
-dependencies = ["numpy"]
+dependencies = ["numpy>=1.21"]  # numpy.typing (NDArray) requires >=1.20
 
 [tool.maturin]
 module-name = "thermorawfile._core"
