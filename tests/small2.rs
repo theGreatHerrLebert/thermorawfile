@@ -39,3 +39,17 @@ fn reads_scan2_centroid_peaks() {
     assert!((peaks[0].intensity - 12.1).abs() < 0.5);
     assert!((peaks[195].mz - 882.6021).abs() < 1e-3, "got {}", peaks[195].mz);
 }
+
+#[test]
+fn reads_scan2_trailer_params() {
+    let rf = RawFile::open(sample("small2.RAW")).expect("open");
+    let p = rf.scan_params(2).expect("scan 2 trailer params");
+    assert_eq!(p.charge_state(), Some(3));
+    assert_eq!(p.ion_injection_time_ms(), Some(50.0));
+    // cross-check: the trailer's monoisotopic m/z equals the scan-2 precursor center.
+    assert!((p.monoisotopic_mz().unwrap() - 398.5411).abs() < 1e-3);
+    assert_eq!(p.isolation_width_mz(), Some(2.0));
+    assert_eq!(p.micro_scan_count(), Some(1));
+    // the underlying record exposes every label, not just the typed accessors
+    assert!(p.record().get("FT Resolution:").is_some());
+}

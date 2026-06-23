@@ -232,6 +232,7 @@ struct MsRunHeader {
     last_scan: u32,
     scan_index_addr: u64,
     data_addr: u64,
+    error_log_addr: u64,
     scantrailer_addr: u64,
     scanparams_addr: u64,
 }
@@ -270,6 +271,8 @@ pub struct RawFile {
     /// Fixed stride of a scan-event record (bytes); 0 if it could not be derived.
     pub scan_event_size: usize,
     pub index: Vec<ScanIndexEntry>,
+    /// Per-scan trailer parameters (v64+ scan-parameters GenericRecord stream); empty if absent.
+    scan_params: Vec<generic_record::GenericRecord>,
 }
 
 fn err(msg: &str) -> io::Error {
@@ -406,6 +409,10 @@ impl RawFile {
             0
         };
 
+        // Best-effort: per-scan trailer parameters (v64+). Failure → empty, file still opens.
+        let scan_params =
+            read_scan_params(&bytes, ms.error_log_addr, ms.scantrailer_addr, ms.scanparams_addr, n);
+
         Ok(RawFile {
             bytes,
             version,
@@ -417,11 +424,19 @@ impl RawFile {
             scanparams_addr: ms.scanparams_addr,
             scan_event_size,
             index,
+            scan_params,
         })
     }
 
     pub fn scan_count(&self) -> usize {
         self.index.len()
+    }
+
+    /// Per-scan trailer parameters (AGC, ion-injection time, charge, FAIMS, NCE, ...) from
+    /// the v64+ scan-parameters stream. `None` if the stream was absent or `scan` is out of range.
+    pub fn scan_params(&self, scan: u32) -> Option<ScanParams<'_>> {
+        let idx = scan.checked_sub(self.first_scan)? as usize;
+        self.scan_params.get(idx).map(ScanParams)
     }
 
     /// Read the centroid peak list for `scan` (1-based). Returns an empty vec for
@@ -1484,7 +1499,7 @@ fn read_runheader(b: &[u8], addr: usize) -> MsRunHeader {
     let scan_index_addr = c.u64();
     let data_addr = c.u64();
     c.u64(); // InstlogAddr
-    c.u64(); // ErrorlogAddr
+    let error_log_addr = c.u64();
     c.u64(); // Unknown9
     let scantrailer_addr = c.u64();
     let scanparams_addr = c.u64();
@@ -1493,8 +1508,102 @@ fn read_runheader(b: &[u8], addr: usize) -> MsRunHeader {
         last_scan,
         scan_index_addr,
         data_addr,
+        error_log_addr,
         scantrailer_addr,
         scanparams_addr,
+    }
+}
+
+/// Best-effort decode of the v64+ per-scan trailer-parameters stream: locate the schema
+/// (GenericDataHeader) in `[error_log_addr, scantrailer_addr)` by signature + expected record
+/// size, then read one fixed-stride record per scan from `scanparams_addr`. Any failure (no
+/// schema, truncation, malformed) yields an empty vec — the file still opens.
+fn read_scan_params(
+    bytes: &[u8],
+    error_log_addr: u64,
+    scantrailer_addr: u64,
+    scanparams_addr: u64,
+    num_scans: usize,
+) -> Vec<generic_record::GenericRecord> {
+    use generic_record::{GenericDataHeader, GenericRecord, SliceReader};
+    let start = error_log_addr as usize;
+    let trailer = scantrailer_addr as usize;
+    let params = scanparams_addr as usize;
+    if num_scans == 0 || start == 0 || start >= trailer || trailer > bytes.len() || params >= bytes.len() {
+        return Vec::new();
+    }
+    let expected = {
+        let tail = bytes.len().saturating_sub(params);
+        let per = tail / num_scans;
+        (per >= 4).then_some(per)
+    };
+    let scan_distance = trailer - start;
+    let mut r = SliceReader::new(bytes);
+    (|| -> io::Result<Vec<GenericRecord>> {
+        r.seek_to(start)?;
+        let hdr = match GenericDataHeader::find_forward(&mut r, scan_distance, expected)? {
+            Some(h) => h,
+            None => return Ok(Vec::new()),
+        };
+        r.seek_to(params)?;
+        let mut out = Vec::with_capacity(num_scans);
+        for _ in 0..num_scans {
+            out.push(GenericRecord::read(&mut r, &hdr)?);
+        }
+        Ok(out)
+    })()
+    .unwrap_or_default()
+}
+
+/// Typed, label-driven view over one scan's trailer record. Labels vary by instrument and
+/// firmware, so each accessor returns `Option` and tries known variants. Label→field mappings
+/// mirror OpenTFRaw's `ScanParams` (Apache-2.0). The underlying [`generic_record::GenericRecord`]
+/// is available via [`ScanParams::record`] for any label not covered here.
+pub struct ScanParams<'a>(&'a generic_record::GenericRecord);
+
+impl<'a> ScanParams<'a> {
+    /// The raw decoded record (query arbitrary labels via its `get_*` methods).
+    pub fn record(&self) -> &'a generic_record::GenericRecord {
+        self.0
+    }
+    pub fn ion_injection_time_ms(&self) -> Option<f64> {
+        self.0
+            .get_f64("Ion Injection Time (ms):")
+            .or_else(|| self.0.get_f64("Ion Inject Time (ms):"))
+    }
+    pub fn charge_state(&self) -> Option<i32> {
+        self.0.get_i32("Charge State:")
+    }
+    pub fn monoisotopic_mz(&self) -> Option<f64> {
+        self.0
+            .get_f64("Monoisotopic M/Z:")
+            .or_else(|| self.0.get_f64("MS2 Isolation M/Z:"))
+            .or_else(|| self.0.get_f64("Isolation Center M/Z:"))
+            .or_else(|| self.0.get_f64("Precursor M/Z:"))
+    }
+    pub fn agc_target(&self) -> Option<i32> {
+        self.0.get_i32("AGC Target:")
+    }
+    pub fn micro_scan_count(&self) -> Option<i32> {
+        self.0.get_i32("Micro Scan Count:")
+    }
+    pub fn master_scan_number(&self) -> Option<i32> {
+        self.0
+            .get_i32("Master Scan Number:")
+            .or_else(|| self.0.get_i32("Master Index:"))
+    }
+    pub fn elapsed_scan_time_s(&self) -> Option<f64> {
+        self.0.get_f64("Elapsed Scan Time (sec):")
+    }
+    pub fn max_ion_time_ms(&self) -> Option<f64> {
+        self.0.get_f64("Max. Ion Time (ms):")
+    }
+    pub fn isolation_width_mz(&self) -> Option<f64> {
+        self.0
+            .get_f64("MS2 Isolation Width:")
+            .or_else(|| self.0.get_f64("MSn Isolation Width:"))
+            .or_else(|| self.0.get_f64("Isolation Width (M/Z):"))
+            .or_else(|| self.0.get_f64("MS2 Isolation Width (M/Z):"))
     }
 }
 
