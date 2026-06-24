@@ -396,6 +396,20 @@ fn err(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
+/// Canonical message for the "authored payload exceeds the scan's packet budget"
+/// overflow returned by [`RawFile::author_centroids`] / [`RawFile::author_profile`].
+/// Exposed so callers can recover from it (by repacking) without sniffing a free-form
+/// string; pair with [`is_over_budget`].
+pub const OVER_BUDGET_MSG: &str = "authored payload exceeds the scan's packet budget";
+
+/// True iff `e` is the over-budget overflow from an in-place `author_*` write — the one
+/// error a caller can recover from with [`RawFile::repack_centroids`] /
+/// [`RawFile::repack_profile`]. Detects the error by its canonical kind+message rather
+/// than a substring, so it can't be confused with an unrelated `InvalidData` error.
+pub fn is_over_budget(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::InvalidData && e.to_string() == OVER_BUDGET_MSG
+}
+
 /// Width of a centroid peak record, selected per scan.
 ///
 /// Centroid record width in BYTES, from the EXACT peaklist-word equation.
@@ -746,6 +760,42 @@ fn put_u64(b: &mut [u8], off: usize, v: u64) {
     b[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
+// Run-header (rev >= 64) 64-bit section-pointer byte offsets, matching the fixed walk
+// in `read_runheader`. Kept here as named constants so the repack relocation and the
+// reader can't drift apart. `RH_END` is the first byte past the last pointer — used to
+// bounds-check a run header before patching it.
+const RH_SCAN_INDEX: usize = 7408;
+const RH_DATA: usize = 7416;
+const RH_INSTLOG: usize = 7424;
+const RH_ERROR_LOG: usize = 7432;
+const RH_SCANTRAILER: usize = 7448;
+const RH_SCANPARAMS: usize = 7456;
+const RH_END: usize = RH_SCANPARAMS + 8;
+/// Every run-header section pointer that can legitimately point INTO or AFTER the data
+/// section, so must be relocated when the data section grows/shrinks. `RH_DATA` is
+/// included because a non-MS controller's data can sit after the MS data region; the MS
+/// controller's own `data` is < the splice boundary and is left untouched by the shift.
+const RH_SECTION_PTRS: [usize; 6] = [
+    RH_SCAN_INDEX,
+    RH_DATA,
+    RH_INSTLOG,
+    RH_ERROR_LOG,
+    RH_SCANTRAILER,
+    RH_SCANPARAMS,
+];
+
+/// Shift a stored address by `delta` iff it sits at/after the splice `boundary`.
+/// Checked: a relocation that would overflow/underflow a u64 is a hard error rather
+/// than a silent wrap into a self-consistent-but-corrupt file.
+fn shift_addr(a: u64, boundary: u64, delta: i64) -> io::Result<u64> {
+    if a >= boundary {
+        a.checked_add_signed(delta)
+            .ok_or_else(|| err("repack: relocated address overflowed u64"))
+    } else {
+        Ok(a)
+    }
+}
+
 impl RawFile {
     /// Overwrite a scan's centroid peak list in place. The new list must have the
     /// **same number of peaks** as the current one (variable counts require a scan-
@@ -1014,7 +1064,7 @@ impl RawFile {
         let descriptor_bytes = k * 4; // K * {u16 index, u8 flags, u8 charge}
         let new_len = 40 + profile_bytes + peaklist_bytes + descriptor_bytes;
         if new_len > old_len {
-            return Err(err("authored profile exceeds the scan's packet budget"));
+            return Err(err(OVER_BUDGET_MSG));
         }
         let profile_words = u32::try_from(profile_bytes / 4).map_err(|_| err("profile too large"))?;
         let peaklist_words =
@@ -1483,7 +1533,7 @@ impl RawFile {
         let descriptor_bytes = k * 4;
         let new_len = 40 + new_pl_bytes + descriptor_bytes;
         if new_len > old_len {
-            return Err(err("authored centroids exceed the scan's packet budget"));
+            return Err(err(OVER_BUDGET_MSG));
         }
         let new_pl_words =
             u32::try_from(new_pl_bytes / 4).map_err(|_| err("peaklist too large"))?;
@@ -1680,7 +1730,7 @@ impl RawFile {
         }
         debug_assert_eq!(o, new_len);
 
-        self.splice_packet_and_relocate(idx, pkt, old_len, p, tic, base_int, base_mz, low_mz, high_mz);
+        self.splice_packet_and_relocate(idx, pkt, old_len, p, tic, base_int, base_mz, low_mz, high_mz)?;
         Ok(())
     }
 
@@ -1705,48 +1755,70 @@ impl RawFile {
         base_mz: f64,
         low_mz: f64,
         high_mz: f64,
-    ) {
+    ) -> io::Result<()> {
+        // Invariant: the packet must lie strictly inside the data section, between
+        // `data_addr` and the scan index. A corrupt offset that violates this could
+        // otherwise produce a self-consistent-but-invalid file.
+        if (pkt as u64) < self.data_addr {
+            return Err(err("repack: packet starts before the data section"));
+        }
+        if (pkt + old_len) as u64 > self.scan_index_addr {
+            return Err(err("repack: packet extends past the data section"));
+        }
+
         let new_len = new_packet.len();
         let delta: i64 = new_len as i64 - old_len as i64;
         self.bytes.splice(pkt..pkt + old_len, new_packet);
 
-        // Any stored address at/after the end of the old packet refers to a byte that
-        // moved by `delta` (delta is negative when shrinking).
+        // Any stored address at/after the end of the OLD packet refers to a byte that
+        // moved by `delta` (negative when shrinking).
         let boundary = (pkt + old_len) as u64;
-        let bump = |a: u64| -> u64 {
-            if a >= boundary {
-                (a as i64 + delta) as u64
-            } else {
-                a
-            }
-        };
 
-        // 1. Controller directory: relocate every device's run-header pointer.
-        for (off, addr) in self.controller_dir.iter_mut() {
-            let nb = bump(*addr);
-            if nb != *addr {
-                put_u64(&mut self.bytes, *off, nb);
-                *addr = nb;
+        // Relocate EVERY controller's run header: the directory pointer plus each of the
+        // run header's section pointers that sit at/after the boundary. Doing all
+        // controllers (not just MS) covers a non-MS device whose sections follow the MS
+        // data region. The MS controller's own `data` pointer is < boundary, so the
+        // shift leaves it untouched.
+        for i in 0..self.controller_dir.len() {
+            let (ptr_off, addr) = self.controller_dir[i];
+            let new_addr = shift_addr(addr, boundary, delta)?;
+            if new_addr != addr {
+                put_u64(&mut self.bytes, ptr_off, new_addr);
+                self.controller_dir[i].1 = new_addr;
+            }
+            let rh = new_addr as usize;
+            // Bounds-check before touching the fixed run-header pointer slots; a run
+            // header too short to contain them carries no section pointers to relocate.
+            if rh.checked_add(RH_END).is_none_or(|e| e > self.bytes.len()) {
+                continue;
+            }
+            for poff in RH_SECTION_PTRS {
+                let cur = u64::from_le_bytes(self.bytes[rh + poff..rh + poff + 8].try_into().unwrap());
+                let nb = shift_addr(cur, boundary, delta)?;
+                if nb != cur {
+                    put_u64(&mut self.bytes, rh + poff, nb);
+                }
             }
         }
-        self.ms_runheader_addr = bump(self.ms_runheader_addr);
+        // Keep the cached MS addresses in sync with what we just patched in-place.
+        self.ms_runheader_addr = shift_addr(self.ms_runheader_addr, boundary, delta)?;
+        self.scan_index_addr = shift_addr(self.scan_index_addr, boundary, delta)?;
+        self.scantrailer_addr = shift_addr(self.scantrailer_addr, boundary, delta)?;
+        self.scanparams_addr = shift_addr(self.scanparams_addr, boundary, delta)?;
+        self.error_log_addr = shift_addr(self.error_log_addr, boundary, delta)?;
 
-        // 2. Run-header 64-bit section pointers (offsets from the read_runheader walk):
-        //    scan_index @ +7408, data @ +7416 (unchanged — data start), instlog @ +7424,
-        //    error_log @ +7432, scantrailer @ +7448, scanparams @ +7456.
-        let rh = self.ms_runheader_addr as usize;
-        for off in [7408usize, 7424, 7432, 7448, 7456] {
-            let cur = u64::from_le_bytes(self.bytes[rh + off..rh + off + 8].try_into().unwrap());
-            put_u64(&mut self.bytes, rh + off, bump(cur));
-        }
-        self.scan_index_addr = bump(self.scan_index_addr);
-        self.scantrailer_addr = bump(self.scantrailer_addr);
-        self.scanparams_addr = bump(self.scanparams_addr);
-        self.error_log_addr = bump(self.error_log_addr);
-
-        // 3. In-memory index: later entries' packets moved by delta; grown entry resized.
-        for j in (idx + 1)..self.index.len() {
-            self.index[j].offset = (self.index[j].offset as i64 + delta) as u64;
+        // In-memory index: relocate by PHYSICAL packet address, not scan-number order —
+        // every entry (except the edited one) whose packet starts at/after the boundary
+        // moved by `delta`. `offset` is relative to `data_addr` (which never moves), so
+        // the relative offset shifts by the same `delta`.
+        for j in 0..self.index.len() {
+            if j == idx {
+                continue;
+            }
+            let abs = self.data_addr + self.index[j].offset;
+            if abs >= boundary {
+                self.index[j].offset = shift_addr(self.index[j].offset, 0, delta)?;
+            }
         }
         let entry = self.index[idx].clone();
         self.index[idx] = ScanIndexEntry {
@@ -1758,15 +1830,19 @@ impl RawFile {
             ..entry
         };
 
-        // 4. Rewrite the scan-index section. Offsets changed for every entry > idx; the
-        //    grown entry's DataPacketSize + stats changed. Offset32 mirror @ +0,
-        //    DataPacketSize @ +20, stats @ +32.. , Offset (u64) @ +72.
+        // Rewrite the scan-index section: each entry's Offset (u64 @ +72) and Offset32
+        // mirror (@ +0); the grown entry's DataPacketSize (@ +20) and stats (@ +32..).
+        // Offset32 is checked — a data section exceeding u32::MAX (>4 GB) can't be
+        // mirrored in 32 bits, so fail loud rather than silently truncate.
         let esz = scan_index_entry_size(self.version);
         let six = self.scan_index_addr as usize;
         for j in 0..self.index.len() {
             let ea = six + j * esz;
             let off = self.index[j].offset;
-            put_u32(&mut self.bytes, ea, off as u32);
+            let off32 = u32::try_from(off).map_err(|_| {
+                err("repack: scan offset exceeds the 32-bit Offset32 mirror (>4 GB data section unsupported)")
+            })?;
+            put_u32(&mut self.bytes, ea, off32);
             put_u64(&mut self.bytes, ea + 72, off);
         }
         let ea = six + idx * esz;
@@ -1776,6 +1852,7 @@ impl RawFile {
         put_f64(&mut self.bytes, ea + 48, base_mz);
         put_f64(&mut self.bytes, ea + 56, low_mz);
         put_f64(&mut self.bytes, ea + 64, high_mz);
+        Ok(())
     }
 
     /// Repack a scan's FTMS profile to a DIFFERENT number of peaks, growing or
@@ -1930,7 +2007,7 @@ impl RawFile {
         }
         debug_assert_eq!(o, new_len);
 
-        self.splice_packet_and_relocate(idx, pkt, old_len, p, tic, base_int, base_mz, low_mz, high_mz);
+        self.splice_packet_and_relocate(idx, pkt, old_len, p, tic, base_int, base_mz, low_mz, high_mz)?;
         Ok(())
     }
 
