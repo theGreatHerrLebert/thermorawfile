@@ -2252,37 +2252,52 @@ impl RawFile {
     /// (e.g. the fragment 150–2000 m/z range for an MS2), **distinct** from the reaction's
     /// isolation window. Returns `None` if undecodable.
     pub fn scan_event_ranges(&self, scan: u32) -> Option<Vec<(f64, f64)>> {
+        // Checked arithmetic + bounded counts, mirroring walk_variable_scan_events: a
+        // malformed event yields None, never a panic/wrap.
         let off = self.scan_event_offset(scan)?;
-        let u32at =
-            |o: usize| -> Option<u32> { self.bytes.get(o..o + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap())) };
-        let f64at =
-            |o: usize| -> Option<f64> { self.bytes.get(o..o + 8).map(|s| f64::from_le_bytes(s.try_into().unwrap())) };
-        let nprec = u32at(off + 136)? as usize;
+        let u32at = |o: usize| -> Option<u32> {
+            self.bytes.get(o..o.checked_add(4)?).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+        };
+        let f64at = |o: usize| -> Option<f64> {
+            self.bytes.get(o..o.checked_add(8)?).map(|s| f64::from_le_bytes(s.try_into().unwrap()))
+        };
+        let nprec = u32at(off.checked_add(136)?)? as usize;
+        if nprec > 16 {
+            return None;
+        }
         let nranges_pos = off.checked_add(140)?.checked_add(nprec.checked_mul(56)?)?;
         let nranges = u32at(nranges_pos)? as usize;
         if nranges > 64 {
             return None;
         }
         let mut ranges = Vec::with_capacity(nranges);
-        let mut p = nranges_pos + 4;
+        let mut p = nranges_pos.checked_add(4)?;
         for _ in 0..nranges {
-            ranges.push((f64at(p)?, f64at(p + 8)?));
-            p += 16;
+            ranges.push((f64at(p)?, f64at(p.checked_add(8)?)?));
+            p = p.checked_add(16)?;
         }
         Some(ranges)
     }
 
-    /// Re-window every MS2 scan in place to a new DIA scheme (Tier-2 increment 3a,
-    /// same-cardinality: scan count/cadence unchanged). `assign(scan, current_event)`
-    /// returns the new `(center, width, collision_energy)` for that MS2 scan, or `None`
-    /// to leave it. Returns the count re-windowed. Call [`save`] afterwards.
+    /// Re-window every MSn (`ms_order >= 2`) scan in place to a new DIA scheme (Tier-2
+    /// increment 3a, same-cardinality: scan count/cadence unchanged). `assign(scan,
+    /// current_event)` returns the new `(center, width, collision_energy)`, or `None` to
+    /// leave that scan. Returns the count re-windowed. Call [`save`] afterwards.
     ///
-    /// This is `set_isolation` per scan: a window-provenance audit on real Fusion + Astral
-    /// DIA files confirmed the isolation window lives **only** in the reaction record —
-    /// the scan-event range block, scan-index low/high, and filter `[lo-hi]` are the
-    /// fragment scan range (not the window), the trailer carries no DIA precursor, and the
-    /// filter is *synthesized* by RawFileReader (no cached string). So no other field needs
-    /// patching. (Changing the window *count* — finer/coarser tiling — is increment 3b.)
+    /// This is `set_isolation` per scan. **For the v66 Orbitrap Fusion + Astral DIA layouts
+    /// we audited** (`examples/window_provenance.rs`), the isolation window is encoded only
+    /// in the reaction record — the scan-event range block, scan-index low/high, and filter
+    /// `[lo-hi]` are the fragment scan range (not the window), the trailer carries no DIA
+    /// precursor, and the filter is *synthesized* by RawFileReader (no cached string) — so
+    /// nothing else needs patching. A non-audited layout / older revision / independent
+    /// consumer could differ; re-validate with RawFileReader (reaction **and** filter) on a
+    /// new layout. (Changing the window *count* — finer/coarser tiling — is increment 3b.)
+    ///
+    /// NB: this is **metadata** re-windowing — it relabels the precursor isolation; it does
+    /// not move peaks. On a *real* template the spectrum was physically acquired under the
+    /// old window, so re-windowing-then-keeping-real-peaks is a synthetic reassignment, not
+    /// a physical transform. (In the TimSim path the peaks are simulated afresh, so this
+    /// caveat doesn't apply there.)
     pub fn rewindow_in_place(
         &mut self,
         mut assign: impl FnMut(u32, &ScanEvent) -> Option<(f64, f64, f64)>,
