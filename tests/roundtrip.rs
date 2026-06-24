@@ -49,6 +49,42 @@ fn pure_rust_write_roundtrip() {
     assert!((orig3[0].mz - new3[0].mz).abs() < 1e-9);
 }
 
+/// Tier-2 3a: re-window all MS2 scans in place (here: halve every isolation width) and
+/// read the new windows back. Gate on a DIA template: `TIMSIM_VARLEN_DIA_TEMPLATE=<dia .raw>`.
+#[test]
+fn rewindow_in_place_roundtrip() {
+    let p = match std::env::var("TIMSIM_VARLEN_DIA_TEMPLATE") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("SKIP rewindow_in_place_roundtrip: set TIMSIM_VARLEN_DIA_TEMPLATE=<dia .raw>");
+            return;
+        }
+    };
+    let before = RawFile::open(&p).unwrap();
+    // Record the first MS2 scan's original window + a neighbor's.
+    let first_ms2 = (before.first_scan..=before.last_scan)
+        .find(|&s| before.scan_event(s).is_some_and(|e| e.ms_order >= 2))
+        .expect("a MS2 scan");
+    let orig = before.scan_event(first_ms2).unwrap();
+
+    let mut rf = RawFile::open(&p).unwrap();
+    // Halve each MS2 window's width; keep center + CE.
+    let n = rf
+        .rewindow_in_place(|_s, e| Some((e.isolation_center, e.isolation_width / 2.0, e.collision_energy)))
+        .unwrap();
+    assert!(n > 0, "expected MS2 scans to re-window");
+
+    let out = format!("{}/rewindowed.raw", env!("CARGO_TARGET_TMPDIR"));
+    rf.save(&out).unwrap();
+    let r = RawFile::open(&out).unwrap();
+    assert!(r.checksum_valid(), "checksum after re-window");
+    let now = r.scan_event(first_ms2).unwrap();
+    assert!((now.isolation_center - orig.isolation_center).abs() < 1e-6, "center preserved");
+    assert!((now.isolation_width - orig.isolation_width / 2.0).abs() < 1e-6, "width halved");
+    assert_eq!(r.scan_event_ranges(first_ms2), before.scan_event_ranges(first_ms2), "scan range unchanged");
+    eprintln!("rewindow OK: {n} MS2 re-windowed; width {} -> {}", orig.isolation_width, now.isolation_width);
+}
+
 /// Variable-length scan events (Orbitrap Fusion-class, no fixed stride) must decode to
 /// the correct per-scan ms-order + isolation windows. Gate on such a file:
 /// `TIMSIM_VARLEN_TEMPLATE=<fusion .raw>`.
