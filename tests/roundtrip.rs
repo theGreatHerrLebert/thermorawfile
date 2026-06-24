@@ -49,6 +49,37 @@ fn pure_rust_write_roundtrip() {
     assert!((orig3[0].mz - new3[0].mz).abs() < 1e-9);
 }
 
+/// Variable-length scan events (Orbitrap Fusion-class, no fixed stride) must decode to
+/// the correct per-scan ms-order + isolation windows. Gate on such a file:
+/// `TIMSIM_VARLEN_TEMPLATE=<fusion .raw>`.
+#[test]
+fn variable_length_scan_events_decode() {
+    let p = match std::env::var("TIMSIM_VARLEN_TEMPLATE") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("SKIP variable_length_scan_events_decode: set TIMSIM_VARLEN_TEMPLATE=<fusion-class .raw>");
+            return;
+        }
+    };
+    let rf = RawFile::open(&p).unwrap();
+    assert!(rf.has_scan_events(), "variable-length scan events must decode to an offset table");
+    let mut ms1 = 0usize;
+    let mut ms2_with_iso = 0usize;
+    for s in rf.first_scan..=rf.last_scan {
+        if let Some(e) = rf.scan_event(s) {
+            if e.ms_order == 1 {
+                ms1 += 1;
+            } else if e.ms_order >= 2 && e.isolation_center > 0.0 && e.isolation_width > 0.0 {
+                ms2_with_iso += 1;
+            }
+        }
+    }
+    // The old fixed-stride-only code mislabeled these as all-MS2 with no isolation.
+    assert!(ms1 > 0, "expected decoded MS1 scans, got none");
+    assert!(ms2_with_iso > 0, "expected MS2 scans with decoded isolation windows, got none");
+    eprintln!("variable-length OK: {ms1} MS1, {ms2_with_iso} MS2 with isolation windows");
+}
+
 /// A controller-directory RunHeaderAddr pointing past EOF (malformed or foreign-layout
 /// file) must produce a graceful Err — NOT a slice panic, which would abort the whole
 /// process when called across the PyO3 boundary.
