@@ -151,6 +151,65 @@ fn repack_profile_grow_roundtrip() {
     assert!(rf2.scan_filter(1).is_some());
 }
 
+/// Batch repack of many scans in one rebuild must equal doing them one-by-one, and
+/// read back correctly.
+#[test]
+fn repack_many_grows_multiple_scans() {
+    use thermorawfile::ScanEdit;
+    let base = RawFile::open(sample("small2.RAW")).unwrap();
+    // Pick the first four MS2/centroid scans (skip the interleaved MS1 profile scans).
+    let targets: Vec<u32> = (base.first_scan..=base.last_scan)
+        .filter(|&s| !base.centroid_peaks(s).is_empty())
+        .take(4)
+        .collect();
+    assert_eq!(targets.len(), 4, "need 4 centroid scans");
+    let untouched = (base.first_scan..=base.last_scan)
+        .find(|&s| !base.centroid_peaks(s).is_empty() && !targets.contains(&s))
+        .unwrap();
+    // Distinct over-budget payloads per scan.
+    let payloads: Vec<Vec<(f64, f32)>> = targets
+        .iter()
+        .map(|&s| {
+            (0..600 + s as usize * 7)
+                .map(|i| (200.0 + i as f64 * 0.3, 50.0 + i as f32))
+                .collect()
+        })
+        .collect();
+    let edits: Vec<ScanEdit> = targets
+        .iter()
+        .zip(&payloads)
+        .map(|(&scan, p)| ScanEdit::Centroids { scan, peaks: p })
+        .collect();
+
+    // Batch: one rebuild.
+    let mut a = RawFile::open(sample("small2.RAW")).unwrap();
+    a.repack_many(&edits).unwrap();
+
+    // Sequential: N splices, same edits in scan order.
+    let mut b = RawFile::open(sample("small2.RAW")).unwrap();
+    for (&s, p) in targets.iter().zip(&payloads) {
+        b.repack_centroids(s, p).unwrap();
+    }
+
+    // Equivalence: the batch rebuild is byte-identical to the sequential result.
+    assert_eq!(a.bytes.len(), b.bytes.len(), "batch vs sequential size differs");
+    assert!(a.bytes == b.bytes, "batch rebuild != sequential repack (bytes differ)");
+
+    // Read back: grown scans have their new counts; an untouched scan is intact.
+    let out = format!("{}/repack_many.raw", env!("CARGO_TARGET_TMPDIR"));
+    a.save(&out).unwrap();
+    let rf = RawFile::open(&out).unwrap();
+    assert!(rf.checksum_valid());
+    for (k, &s) in targets.iter().enumerate() {
+        assert_eq!(rf.centroid_peaks(s).len(), payloads[k].len(), "scan {s} count");
+    }
+    assert_eq!(
+        base.centroid_peaks(untouched).len(),
+        rf.centroid_peaks(untouched).len(),
+        "untouched scan {untouched}"
+    );
+}
+
 /// Repack to FEWER peaks (shrink) must also keep the file consistent.
 #[test]
 fn repack_shrink_roundtrip() {

@@ -786,6 +786,34 @@ const RH_SECTION_PTRS: [usize; 6] = [
     RH_SCANPARAMS,
 ];
 
+/// Per-scan summary statistics that go into the scan-index entry, computed while a
+/// packet is built so the build step is splice-free (used by the single and batch
+/// repack paths).
+#[derive(Clone, Copy)]
+struct PacketStats {
+    tic: f64,
+    base_int: f64,
+    base_mz: f64,
+    low_mz: f64,
+    high_mz: f64,
+}
+
+/// One scan to rewrite in a batch [`RawFile::repack_many`].
+pub enum ScanEdit<'a> {
+    /// Replace `scan`'s centroid peak list.
+    Centroids { scan: u32, peaks: &'a [(f64, f32)] },
+    /// Replace `scan`'s FTMS profile (binned onto its existing grid via `calib`).
+    Profile { scan: u32, peaks: &'a [(f64, f32)], calib: &'a Calibration },
+}
+
+impl ScanEdit<'_> {
+    fn scan(&self) -> u32 {
+        match *self {
+            ScanEdit::Centroids { scan, .. } | ScanEdit::Profile { scan, .. } => scan,
+        }
+    }
+}
+
 /// Shift a stored address by `delta` iff it sits at/after the splice `boundary`.
 /// Checked: a relocation that would overflow/underflow a u64 is a hard error rather
 /// than a silent wrap into a self-consistent-but-corrupt file.
@@ -1634,6 +1662,21 @@ impl RawFile {
     /// pointers inside the instrument-method / log / tune sections. Validate output
     /// against the official RawFileReader before trusting it for production.
     pub fn repack_centroids(&mut self, scan: u32, peaks: &[(f64, f32)]) -> io::Result<()> {
+        let (p, s) = self.build_centroid_packet(scan, peaks)?;
+        let idx = (scan - self.first_scan) as usize;
+        let pkt = (self.data_addr + self.index[idx].offset) as usize;
+        let old_len = self.index[idx].data_packet_size as usize;
+        self.splice_packet_and_relocate(idx, pkt, old_len, p, s)
+    }
+
+    /// Build the replacement centroid packet bytes + summary stats for `scan` WITHOUT
+    /// mutating the file. Shared by [`repack_centroids`] (single splice) and
+    /// [`repack_many`] (one-pass rebuild).
+    fn build_centroid_packet(
+        &self,
+        scan: u32,
+        peaks: &[(f64, f32)],
+    ) -> io::Result<(Vec<u8>, PacketStats)> {
         if scan < self.first_scan || scan > self.last_scan {
             return Err(err("scan out of range"));
         }
@@ -1732,8 +1775,7 @@ impl RawFile {
         }
         debug_assert_eq!(o, new_len);
 
-        self.splice_packet_and_relocate(idx, pkt, old_len, p, tic, base_int, base_mz, low_mz, high_mz)?;
-        Ok(())
+        Ok((p, PacketStats { tic, base_int, base_mz, low_mz, high_mz }))
     }
 
     /// Splice a freshly-built packet in place of scan `idx`'s old packet and relocate
@@ -1752,11 +1794,7 @@ impl RawFile {
         pkt: usize,
         old_len: usize,
         new_packet: Vec<u8>,
-        tic: f64,
-        base_int: f64,
-        base_mz: f64,
-        low_mz: f64,
-        high_mz: f64,
+        stats: PacketStats,
     ) -> io::Result<()> {
         // Invariant: the packet must lie strictly inside the data section, between
         // `data_addr` and the scan index. A corrupt offset that violates this could
@@ -1772,15 +1810,37 @@ impl RawFile {
         let delta: i64 = new_len as i64 - old_len as i64;
         self.bytes.splice(pkt..pkt + old_len, new_packet);
 
-        // Any stored address at/after the end of the OLD packet refers to a byte that
-        // moved by `delta` (negative when shrinking).
+        // Any stored address at/after the end of the OLD packet moved by `delta`.
         let boundary = (pkt + old_len) as u64;
+        self.relocate_sections_after(boundary, delta)?;
 
-        // Relocate EVERY controller's run header: the directory pointer plus each of the
-        // run header's section pointers that sit at/after the boundary. Doing all
-        // controllers (not just MS) covers a non-MS device whose sections follow the MS
-        // data region. The MS controller's own `data` pointer is < boundary, so the
-        // shift leaves it untouched.
+        // In-memory index: relocate by PHYSICAL packet address, not scan-number order —
+        // every entry (except the edited one) whose packet starts at/after the boundary
+        // moved by `delta`. `offset` is relative to `data_addr` (which never moves).
+        for j in 0..self.index.len() {
+            if j == idx {
+                continue;
+            }
+            let abs = self.data_addr + self.index[j].offset;
+            if abs >= boundary {
+                self.index[j].offset = shift_addr(self.index[j].offset, 0, delta)?;
+            }
+        }
+        self.index[idx].data_packet_size = new_len as u32;
+        self.write_index_offsets()?;
+        self.write_index_stats(idx, stats);
+        Ok(())
+    }
+
+    /// Relocate every file region that physically follows `boundary` by `delta`: each
+    /// controller-directory pointer, each controller's run-header section pointers, and
+    /// the cached MS section addresses. The scan-index ENTRIES are relocated separately
+    /// by the caller, which owns the per-entry model. Shared by the single-splice and
+    /// batch-rebuild repack paths.
+    fn relocate_sections_after(&mut self, boundary: u64, delta: i64) -> io::Result<()> {
+        // Doing ALL controllers (not just MS) covers a non-MS device whose sections
+        // follow the MS data region. The MS controller's own `data` pointer is
+        // < boundary, so the shift leaves it untouched.
         for i in 0..self.controller_dir.len() {
             let (ptr_off, addr) = self.controller_dir[i];
             let new_addr = shift_addr(addr, boundary, delta)?;
@@ -1789,8 +1849,8 @@ impl RawFile {
                 self.controller_dir[i].1 = new_addr;
             }
             let rh = new_addr as usize;
-            // Bounds-check before touching the fixed run-header pointer slots; a run
-            // header too short to contain them carries no section pointers to relocate.
+            // Bounds-check before touching the fixed pointer slots; a run header too
+            // short to contain them carries no section pointers to relocate.
             if rh.checked_add(RH_END).is_none_or(|e| e > self.bytes.len()) {
                 continue;
             }
@@ -1801,54 +1861,25 @@ impl RawFile {
                     put_u64(&mut self.bytes, rh + poff, nb);
                 }
             }
-            // NB: the 32-bit "…Addr32" mirror slots that precede these pointers are
-            // *zeroed* on rev >= 64 (64-bit addressing is authoritative; verified by
-            // direct inspection of Velos Pro + Astral run headers — the slots hold
-            // counts/flags, not addresses). There is nothing to relocate there.
+            // (The 32-bit "…Addr32" slots preceding these are zeroed on rev >= 64 —
+            // counts/flags, not live address mirrors — so there is nothing to relocate.)
         }
-        // Keep the cached MS addresses in sync with what we just patched in-place.
         self.ms_runheader_addr = shift_addr(self.ms_runheader_addr, boundary, delta)?;
         self.scan_index_addr = shift_addr(self.scan_index_addr, boundary, delta)?;
         self.scantrailer_addr = shift_addr(self.scantrailer_addr, boundary, delta)?;
         self.scanparams_addr = shift_addr(self.scanparams_addr, boundary, delta)?;
         self.error_log_addr = shift_addr(self.error_log_addr, boundary, delta)?;
+        Ok(())
+    }
 
-        // In-memory index: relocate by PHYSICAL packet address, not scan-number order —
-        // every entry (except the edited one) whose packet starts at/after the boundary
-        // moved by `delta`. `offset` is relative to `data_addr` (which never moves), so
-        // the relative offset shifts by the same `delta`.
-        for j in 0..self.index.len() {
-            if j == idx {
-                continue;
-            }
-            let abs = self.data_addr + self.index[j].offset;
-            if abs >= boundary {
-                self.index[j].offset = shift_addr(self.index[j].offset, 0, delta)?;
-            }
-        }
-        let entry = self.index[idx].clone();
-        self.index[idx] = ScanIndexEntry {
-            data_packet_size: new_len as u32,
-            total_current: tic,
-            base_mz,
-            low_mz,
-            high_mz,
-            ..entry
-        };
-
-        // Rewrite the scan-index section: each entry's Offset (u64 @ +72), and the
-        // grown entry's DataPacketSize (@ +20) and stats (@ +32..). The Offset32 mirror
-        // (@ +0) is *zeroed* on rev >= 64 (the 64-bit Offset is authoritative; verified
-        // on Velos Pro + Astral). Preserve that convention: only rewrite Offset32 for an
-        // entry whose file actually populates it (an older/quirk file), and then fail
-        // loud rather than silently truncate a >4 GB offset.
+    /// Rewrite every scan-index entry's Offset (u64 @ +72) and DataPacketSize (@ +20)
+    /// from the in-memory model, plus the 32-bit Offset32 mirror (@ +0) IF this file
+    /// populates it (rev >= 64 zeroes it — the 64-bit Offset is authoritative; preserve
+    /// that rather than fabricate). Decided per FILE: a populated-mirror file may
+    /// legitimately have a zero first entry, which a per-entry test would misread.
+    fn write_index_offsets(&mut self) -> io::Result<()> {
         let esz = scan_index_entry_size(self.version);
         let six = self.scan_index_addr as usize;
-        // Decide Offset32 handling per FILE, not per entry: a populated-mirror file may
-        // legitimately have a zero in the first entry (offset 0), so a per-entry test
-        // would misread it as structural-zero. If ANY entry's Offset32 is non-zero, the
-        // file mirrors offsets and we rewrite them all; otherwise (rev>=64 norm) leave
-        // the field zero rather than fabricate one.
         let populates_offset32 = (0..self.index.len()).any(|j| {
             let ea = six + j * esz;
             u32::from_le_bytes(self.bytes[ea..ea + 4].try_into().unwrap()) != 0
@@ -1856,21 +1887,119 @@ impl RawFile {
         for j in 0..self.index.len() {
             let ea = six + j * esz;
             let off = self.index[j].offset;
+            let size = self.index[j].data_packet_size;
             if populates_offset32 {
                 let off32 = u32::try_from(off).map_err(|_| {
                     err("repack: scan offset exceeds the 32-bit Offset32 mirror (>4 GB data section unsupported)")
                 })?;
                 put_u32(&mut self.bytes, ea, off32);
             }
+            put_u32(&mut self.bytes, ea + 20, size);
             put_u64(&mut self.bytes, ea + 72, off);
         }
-        let ea = six + idx * esz;
-        put_u32(&mut self.bytes, ea + 20, new_len as u32);
-        put_f64(&mut self.bytes, ea + 32, tic);
-        put_f64(&mut self.bytes, ea + 40, base_int);
-        put_f64(&mut self.bytes, ea + 48, base_mz);
-        put_f64(&mut self.bytes, ea + 56, low_mz);
-        put_f64(&mut self.bytes, ea + 64, high_mz);
+        Ok(())
+    }
+
+    /// Write one entry's summary stats (@ +32..) and sync the cached index entry.
+    fn write_index_stats(&mut self, idx: usize, s: PacketStats) {
+        let esz = scan_index_entry_size(self.version);
+        let ea = self.scan_index_addr as usize + idx * esz;
+        put_f64(&mut self.bytes, ea + 32, s.tic);
+        put_f64(&mut self.bytes, ea + 40, s.base_int);
+        put_f64(&mut self.bytes, ea + 48, s.base_mz);
+        put_f64(&mut self.bytes, ea + 56, s.low_mz);
+        put_f64(&mut self.bytes, ea + 64, s.high_mz);
+        let entry = self.index[idx].clone();
+        self.index[idx] = ScanIndexEntry {
+            total_current: s.tic,
+            base_mz: s.base_mz,
+            low_mz: s.low_mz,
+            high_mz: s.high_mz,
+            ..entry
+        };
+    }
+
+    /// Apply many scan edits in a SINGLE O(total-bytes) rebuild of the data section,
+    /// instead of one splice per edit (which is O(edits × file size) because each splice
+    /// memmoves the whole tail). Use this when growing many scans past the template
+    /// budget — e.g. a simulation that raises the peak cap above what the template slots
+    /// hold, so most scans overflow.
+    ///
+    /// Requires the data section to be contiguous packets in scan order (the Thermo
+    /// norm); otherwise it errors rather than risk a corrupt rebuild — fall back to
+    /// per-scan repack. Call [`RawFile::save`] afterwards.
+    pub fn repack_many(&mut self, edits: &[ScanEdit]) -> io::Result<()> {
+        if edits.is_empty() {
+            return Ok(());
+        }
+        let mut replaced: std::collections::HashMap<usize, (Vec<u8>, PacketStats)> =
+            std::collections::HashMap::new();
+        for e in edits {
+            let scan = e.scan();
+            if scan < self.first_scan || scan > self.last_scan {
+                return Err(err("repack_many: scan out of range"));
+            }
+            let idx = (scan - self.first_scan) as usize;
+            if replaced.contains_key(&idx) {
+                return Err(err("repack_many: duplicate scan in edit list"));
+            }
+            let built = match e {
+                ScanEdit::Centroids { scan, peaks } => self.build_centroid_packet(*scan, peaks)?,
+                ScanEdit::Profile { scan, peaks, calib } => {
+                    self.build_profile_packet(*scan, peaks, calib)?
+                }
+            };
+            replaced.insert(idx, built);
+        }
+
+        // The data section must be contiguous packets in scan order for a clean rebuild.
+        let n = self.index.len();
+        let data_start = self.data_addr as usize;
+        let mut expected = 0u64;
+        for j in 0..n {
+            if self.index[j].offset != expected {
+                return Err(err(
+                    "repack_many: data section not contiguous/in-order; use per-scan repack",
+                ));
+            }
+            expected += self.index[j].data_packet_size as u64;
+        }
+        let old_data_len = expected as usize;
+        let old_data_end = data_start + old_data_len;
+        if old_data_end > self.bytes.len() || old_data_end as u64 > self.scan_index_addr {
+            return Err(err("repack_many: data section overruns file / scan index"));
+        }
+
+        // Lay out the new data section in one pass: edited packets replace, others copy.
+        let mut new_data: Vec<u8> = Vec::with_capacity(old_data_len);
+        let mut new_off = vec![0u64; n];
+        let mut new_size = vec![0u32; n];
+        for j in 0..n {
+            new_off[j] = new_data.len() as u64;
+            if let Some((bytes, _)) = replaced.get(&j) {
+                new_data.extend_from_slice(bytes);
+                new_size[j] = bytes.len() as u32;
+            } else {
+                let pkt = data_start + self.index[j].offset as usize;
+                let sz = self.index[j].data_packet_size as usize;
+                new_data.extend_from_slice(&self.bytes[pkt..pkt + sz]);
+                new_size[j] = sz as u32;
+            }
+        }
+        let delta: i64 = new_data.len() as i64 - old_data_len as i64;
+
+        // ONE splice of the entire data section, then relocate the trailing graph once.
+        self.bytes.splice(data_start..old_data_end, new_data);
+        self.relocate_sections_after(old_data_end as u64, delta)?;
+
+        for j in 0..n {
+            self.index[j].offset = new_off[j];
+            self.index[j].data_packet_size = new_size[j];
+        }
+        self.write_index_offsets()?;
+        for (&idx, (_, stats)) in &replaced {
+            self.write_index_stats(idx, *stats);
+        }
         Ok(())
     }
 
@@ -1889,6 +2018,21 @@ impl RawFile {
         peaks: &[(f64, f32)],
         calib: &Calibration,
     ) -> io::Result<()> {
+        let (p, s) = self.build_profile_packet(scan, peaks, calib)?;
+        let idx = (scan - self.first_scan) as usize;
+        let pkt = (self.data_addr + self.index[idx].offset) as usize;
+        let old_len = self.index[idx].data_packet_size as usize;
+        self.splice_packet_and_relocate(idx, pkt, old_len, p, s)
+    }
+
+    /// Build the replacement profile packet bytes + stats for `scan` WITHOUT mutating the
+    /// file. Shared by [`repack_profile`] (single splice) and [`repack_many`].
+    fn build_profile_packet(
+        &self,
+        scan: u32,
+        peaks: &[(f64, f32)],
+        calib: &Calibration,
+    ) -> io::Result<(Vec<u8>, PacketStats)> {
         if scan < self.first_scan || scan > self.last_scan {
             return Err(err("scan out of range"));
         }
@@ -2026,8 +2170,7 @@ impl RawFile {
         }
         debug_assert_eq!(o, new_len);
 
-        self.splice_packet_and_relocate(idx, pkt, old_len, p, tic, base_int, base_mz, low_mz, high_mz)?;
-        Ok(())
+        Ok((p, PacketStats { tic, base_int, base_mz, low_mz, high_mz }))
     }
 
     /// Recompute and write the Adler-32 integrity checksum into the header.
