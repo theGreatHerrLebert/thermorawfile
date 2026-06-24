@@ -383,6 +383,10 @@ pub struct RawFile {
     pub error_log_addr: u64,
     /// Fixed stride of a scan-event record (bytes); 0 if it could not be derived.
     pub scan_event_size: usize,
+    /// Absolute byte offset of each scan's event record, one per scan (first..=last).
+    /// Empty if the scan events could not be decoded. Authoritative for both fixed-
+    /// stride and variable-length layouts (see `walk_variable_scan_events`).
+    scan_event_offsets: Vec<usize>,
     pub index: Vec<ScanIndexEntry>,
     /// Per-scan trailer parameters (v64+ scan-parameters GenericRecord stream); empty if absent.
     scan_params: Vec<generic_record::GenericRecord>,
@@ -552,12 +556,26 @@ impl RawFile {
             });
         }
 
-        // Scan events are a fixed-stride array in [scantrailer+4, scanparams).
+        // Scan events live in [scantrailer+4, scanparams). Two layouts:
+        //  - FIXED-stride (Astral, Velos): every event padded to the same size, so the
+        //    stride is region/n exactly.
+        //  - VARIABLE-length (Orbitrap Fusion-class): MS1 events are shorter than MS2
+        //    (no reaction record), so there is no single stride; the per-event offsets
+        //    must be derived by walking the event grammar.
+        // `scan_event_size` is kept as the fixed stride (0 when variable);
+        // `scan_event_offsets` is the authoritative per-scan offset table for both.
         let region = (ms.scanparams_addr).saturating_sub(ms.scantrailer_addr + 4) as usize;
         let scan_event_size = if n > 0 && region >= n && region % n == 0 {
             region / n
         } else {
             0
+        };
+        let base = ms.scantrailer_addr as usize + 4;
+        let scan_event_offsets: Vec<usize> = if scan_event_size > 0 {
+            (0..n).map(|i| base + i * scan_event_size).collect()
+        } else {
+            walk_variable_scan_events(&bytes, base, ms.scanparams_addr as usize, n)
+                .unwrap_or_default()
         };
 
         // Best-effort: per-scan trailer parameters (v64+). Failure → empty, file still opens.
@@ -578,6 +596,7 @@ impl RawFile {
             controller_dir,
             error_log_addr: ms.error_log_addr,
             scan_event_size,
+            scan_event_offsets,
             index,
             scan_params,
             acquired,
@@ -2201,14 +2220,19 @@ impl RawFile {
     }
 
     fn scan_event_offset(&self, scan: u32) -> Option<usize> {
-        if self.scan_event_size == 0 || scan < self.first_scan || scan > self.last_scan {
+        if scan < self.first_scan {
             return None;
         }
-        Some(
-            self.scantrailer_addr as usize
-                + 4
-                + (scan - self.first_scan) as usize * self.scan_event_size,
-        )
+        self.scan_event_offsets
+            .get((scan - self.first_scan) as usize)
+            .copied()
+    }
+
+    /// Whether per-scan scan events (ms-level, isolation, CE) could be decoded for this
+    /// file. False for a layout whose event grammar we can't walk — callers that need
+    /// reliable per-scan metadata should check this rather than assume.
+    pub fn has_scan_events(&self) -> bool {
+        !self.scan_event_offsets.is_empty()
     }
 
     /// Read the acquisition descriptor (MS order, analyzer, isolation, CE) for `scan`.
@@ -2329,6 +2353,61 @@ impl RawFile {
 
 fn read_version(b: &[u8]) -> u32 {
     u32::from_le_bytes(b[36..40].try_into().unwrap())
+}
+
+/// Walk the variable-length scan-event stream (Orbitrap Fusion-class) to derive each
+/// event's absolute byte offset. Returns one offset per scan, or `None` if the grammar
+/// doesn't fit — a fail-safe: a layout we can't model yields no offsets rather than
+/// silently wrong per-scan metadata.
+///
+/// Event grammar (rev 66; reverse-engineered and validated against Orbitrap Fusion
+/// DIA + DDA — the walk consumes `[base, region_end)` exactly over `n` events and the
+/// decoded ms-order / isolation match the official RawFileReader):
+/// ```text
+///   preamble[136]
+///   nprec:   u32                 (0 for MS1, >=1 for MSn)
+///   reaction[nprec]              (56 bytes each: precursor m/z @+0, isolation width @+8, energy @+16, +flags)
+///   nranges: u32
+///   range[nranges]               (16 bytes each: low f64, high f64)
+///   calibration: u32 nparam, then 40 + 4*nparam bytes  =>  block = 44 + 4*nparam
+/// ```
+/// (calib block: nparam=5 → 64 bytes (Astral), nparam=7 → 72 bytes (Fusion).)
+fn walk_variable_scan_events(b: &[u8], base: usize, region_end: usize, n: usize) -> Option<Vec<usize>> {
+    const PREAMBLE: usize = 136;
+    const REACTION: usize = 56;
+    const RANGE: usize = 16;
+    let u32at = |o: usize| -> Option<u32> {
+        b.get(o..o + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+    };
+    let mut offsets = Vec::with_capacity(n);
+    let mut off = base;
+    for _ in 0..n {
+        if off + PREAMBLE + 4 > region_end {
+            return None;
+        }
+        offsets.push(off);
+        let nprec = u32at(off + PREAMBLE)? as usize;
+        if nprec > 16 {
+            return None; // implausible reaction count → grammar mismatch
+        }
+        let nranges_pos = off + PREAMBLE + 4 + nprec * REACTION;
+        let nranges = u32at(nranges_pos)? as usize;
+        if nranges > 64 {
+            return None;
+        }
+        let calib_pos = nranges_pos + 4 + nranges * RANGE;
+        let nparam = u32at(calib_pos)? as usize;
+        if nparam > 64 {
+            return None;
+        }
+        off = calib_pos + 44 + 4 * nparam;
+        if off > region_end {
+            return None;
+        }
+    }
+    // A correct grammar consumes the event region EXACTLY; otherwise treat it as
+    // undecodable (None) rather than trust offsets derived from a mismatched model.
+    (off == region_end).then_some(offsets)
 }
 
 /// Run-header parse for rev >= 64 (64-bit addresses). Returns `None` if `addr` (a
