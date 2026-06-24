@@ -763,7 +763,9 @@ fn put_u64(b: &mut [u8], off: usize, v: u64) {
 // Run-header (rev >= 64) 64-bit section-pointer byte offsets, matching the fixed walk
 // in `read_runheader`. Kept here as named constants so the repack relocation and the
 // reader can't drift apart. `RH_END` is the first byte past the last pointer — used to
-// bounds-check a run header before patching it.
+// bounds-check a run header before patching it. (The 10 u32 "…Addr32" slots that
+// precede these are zeroed on rev >= 64 — counts/flags, not live address mirrors — so
+// there is nothing to relocate there.)
 const RH_SCAN_INDEX: usize = 7408;
 const RH_DATA: usize = 7416;
 const RH_INSTLOG: usize = 7424;
@@ -1799,6 +1801,10 @@ impl RawFile {
                     put_u64(&mut self.bytes, rh + poff, nb);
                 }
             }
+            // NB: the 32-bit "…Addr32" mirror slots that precede these pointers are
+            // *zeroed* on rev >= 64 (64-bit addressing is authoritative; verified by
+            // direct inspection of Velos Pro + Astral run headers — the slots hold
+            // counts/flags, not addresses). There is nothing to relocate there.
         }
         // Keep the cached MS addresses in sync with what we just patched in-place.
         self.ms_runheader_addr = shift_addr(self.ms_runheader_addr, boundary, delta)?;
@@ -1830,19 +1836,24 @@ impl RawFile {
             ..entry
         };
 
-        // Rewrite the scan-index section: each entry's Offset (u64 @ +72) and Offset32
-        // mirror (@ +0); the grown entry's DataPacketSize (@ +20) and stats (@ +32..).
-        // Offset32 is checked — a data section exceeding u32::MAX (>4 GB) can't be
-        // mirrored in 32 bits, so fail loud rather than silently truncate.
+        // Rewrite the scan-index section: each entry's Offset (u64 @ +72), and the
+        // grown entry's DataPacketSize (@ +20) and stats (@ +32..). The Offset32 mirror
+        // (@ +0) is *zeroed* on rev >= 64 (the 64-bit Offset is authoritative; verified
+        // on Velos Pro + Astral). Preserve that convention: only rewrite Offset32 for an
+        // entry whose file actually populates it (an older/quirk file), and then fail
+        // loud rather than silently truncate a >4 GB offset.
         let esz = scan_index_entry_size(self.version);
         let six = self.scan_index_addr as usize;
         for j in 0..self.index.len() {
             let ea = six + j * esz;
             let off = self.index[j].offset;
-            let off32 = u32::try_from(off).map_err(|_| {
-                err("repack: scan offset exceeds the 32-bit Offset32 mirror (>4 GB data section unsupported)")
-            })?;
-            put_u32(&mut self.bytes, ea, off32);
+            let cur32 = u32::from_le_bytes(self.bytes[ea..ea + 4].try_into().unwrap());
+            if cur32 != 0 {
+                let off32 = u32::try_from(off).map_err(|_| {
+                    err("repack: scan offset exceeds the 32-bit Offset32 mirror (>4 GB data section unsupported)")
+                })?;
+                put_u32(&mut self.bytes, ea, off32);
+            }
             put_u64(&mut self.bytes, ea + 72, off);
         }
         let ea = six + idx * esz;
@@ -2473,6 +2484,57 @@ impl RawFile {
     ) -> io::Result<()> {
         self.author_centroids(scan, peaks)?;
         self.verify_centroids(scan, peaks, mz_tol_ppm)
+    }
+}
+
+#[cfg(test)]
+mod repack_index_convention_tests {
+    use super::{scan_index_entry_size, RawFile};
+
+    // rev>=64 zeroes the scan-index Offset32 mirror (@ +0); the 64-bit Offset (@ +72)
+    // is authoritative. A grow-repack must PRESERVE that convention — not fabricate a
+    // non-zero Offset32 — while keeping the 64-bit offsets contiguous and correct.
+    #[test]
+    fn repack_preserves_offset32_zero_and_offsets_contiguous() {
+        let path = format!("{}/tests/data/small2.RAW", env!("CARGO_MANIFEST_DIR"));
+        let before = RawFile::open(&path).unwrap();
+        let esz = scan_index_entry_size(before.version);
+        let six0 = before.scan_index_addr as usize;
+        // Precondition: the fixture really does zero every Offset32.
+        assert!(
+            (0..before.index.len()).all(|j| {
+                let ea = six0 + j * esz;
+                u32::from_le_bytes(before.bytes[ea..ea + 4].try_into().unwrap()) == 0
+            }),
+            "fixture precondition: all Offset32 are zero on rev>=64"
+        );
+
+        let mut rf = RawFile::open(&path).unwrap();
+        let n = before.centroid_peaks(2).len();
+        let grown: Vec<(f64, f32)> =
+            (0..n * 3).map(|i| (250.0 + i as f64 * 0.5, 700.0 + i as f32)).collect();
+        rf.repack_centroids(2, &grown).unwrap();
+
+        let six = rf.scan_index_addr as usize;
+        for j in 0..rf.index.len() {
+            let ea = six + j * esz;
+            // Offset32 stays zero (convention preserved, no fabricated value).
+            assert_eq!(
+                u32::from_le_bytes(rf.bytes[ea..ea + 4].try_into().unwrap()),
+                0,
+                "Offset32 must stay zero after repack (entry {j})"
+            );
+            // The 64-bit Offset on disk matches the in-memory model.
+            let on_disk = u64::from_le_bytes(rf.bytes[ea + 72..ea + 80].try_into().unwrap());
+            assert_eq!(on_disk, rf.index[j].offset, "Offset(+72) mismatch (entry {j})");
+        }
+        // Offsets are still strictly increasing (packets remain contiguous, in order).
+        for j in 1..rf.index.len() {
+            assert!(
+                rf.index[j].offset > rf.index[j - 1].offset,
+                "offsets not monotonic at {j}"
+            );
+        }
     }
 }
 
