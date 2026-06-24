@@ -570,9 +570,14 @@ impl RawFile {
         } else {
             0
         };
-        let base = ms.scantrailer_addr as usize + 4;
+        let base = (ms.scantrailer_addr as usize).saturating_add(4);
         let scan_event_offsets: Vec<usize> = if scan_event_size > 0 {
-            (0..n).map(|i| base + i * scan_event_size).collect()
+            // Checked: a corrupt stride/address yields an empty table (→ no scan events)
+            // rather than wrapped offsets.
+            (0..n)
+                .map(|i| i.checked_mul(scan_event_size).and_then(|d| base.checked_add(d)))
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_default()
         } else {
             walk_variable_scan_events(&bytes, base, ms.scanparams_addr as usize, n)
                 .unwrap_or_default()
@@ -2376,13 +2381,17 @@ fn walk_variable_scan_events(b: &[u8], base: usize, region_end: usize, n: usize)
     const PREAMBLE: usize = 136;
     const REACTION: usize = 56;
     const RANGE: usize = 16;
+    // All offset arithmetic is checked: a malformed/foreign file (e.g. a garbage-huge
+    // scantrailer address) must yield `None`, never a panic (debug) or wrapped offset
+    // (release). u32at reads a u32 only if the 4-byte window is fully in bounds.
     let u32at = |o: usize| -> Option<u32> {
-        b.get(o..o + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+        let end = o.checked_add(4)?;
+        b.get(o..end).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
     };
-    let mut offsets = Vec::with_capacity(n);
+    let mut offsets = Vec::with_capacity(n.min(1 << 20));
     let mut off = base;
     for _ in 0..n {
-        if off + PREAMBLE + 4 > region_end {
+        if off.checked_add(PREAMBLE + 4).map_or(true, |e| e > region_end) {
             return None;
         }
         offsets.push(off);
@@ -2390,23 +2399,28 @@ fn walk_variable_scan_events(b: &[u8], base: usize, region_end: usize, n: usize)
         if nprec > 16 {
             return None; // implausible reaction count → grammar mismatch
         }
-        let nranges_pos = off + PREAMBLE + 4 + nprec * REACTION;
+        // nprec/nranges/nparam are bounded above, so the per-event products are small;
+        // checked_add still guards against an overflowing base offset.
+        let nranges_pos = (off + PREAMBLE + 4).checked_add(nprec * REACTION)?;
         let nranges = u32at(nranges_pos)? as usize;
         if nranges > 64 {
             return None;
         }
-        let calib_pos = nranges_pos + 4 + nranges * RANGE;
+        let calib_pos = nranges_pos.checked_add(4 + nranges * RANGE)?;
         let nparam = u32at(calib_pos)? as usize;
         if nparam > 64 {
             return None;
         }
-        off = calib_pos + 44 + 4 * nparam;
+        off = calib_pos.checked_add(44 + 4 * nparam)?;
         if off > region_end {
             return None;
         }
     }
     // A correct grammar consumes the event region EXACTLY; otherwise treat it as
     // undecodable (None) rather than trust offsets derived from a mismatched model.
+    // (Exact byte accounting + the decoded ms-order/isolation matching RawFileReader on
+    // real Fusion data is the correctness evidence; exact match alone is necessary, not
+    // sufficient — a layout with identical block sizes but moved fields could still slip.)
     (off == region_end).then_some(offsets)
 }
 
