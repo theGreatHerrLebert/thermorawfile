@@ -104,6 +104,53 @@ fn repack_grow_roundtrip() {
     assert!(rf2.scan_filter(base.last_scan).is_some());
 }
 
+/// Tier 1 (profile): repack an FTMS MS1 profile scan to MORE peaks than its budget,
+/// binning onto the existing grid, then re-read and assert consistency.
+#[test]
+fn repack_profile_grow_roundtrip() {
+    let mut rf = RawFile::open(sample("small2.RAW")).unwrap();
+    // Scan 1 is the MS1 profile scan; its calibration is at scantrailer_addr + 4.
+    let cal = rf
+        .calibration_at_event(rf.scantrailer_addr as usize + 4)
+        .expect("MS1 calibration");
+    let prof = rf.profile(1).expect("scan 1 has a profile");
+    let (fv, step, nbins) = (prof.first_value, prof.step, prof.nbins);
+
+    // Build K on-grid peaks, keeping only bins that round-trip to themselves through
+    // the quadratic calibration (its freq() inverse is double-valued for some m/z —
+    // a calibration property, independent of the repack). K > the scan's 3032 profile
+    // points, so the packet must grow.
+    let k = 4000usize;
+    let mut grown: Vec<(f64, f32)> = Vec::with_capacity(k);
+    let mut bin = 1u32;
+    while grown.len() < k && bin < nbins {
+        let mz = cal.mz(fv + bin as f64 * step);
+        if let Some(f) = cal.freq(mz) {
+            let rb = ((f - fv) / step).round();
+            if rb >= 0.0 && rb < nbins as f64 && rb as u32 == bin {
+                let n = grown.len();
+                grown.push((mz, 1000.0 + n as f32));
+            }
+        }
+        bin += 1;
+    }
+    assert!(grown.len() >= 3500, "expected a grow; only {} valid bins", grown.len());
+    let k = grown.len();
+
+    rf.repack_profile(1, &grown, &cal).unwrap();
+    let out = format!("{}/repacked_profile.raw", env!("CARGO_TARGET_TMPDIR"));
+    rf.save(&out).unwrap();
+
+    let rf2 = RawFile::open(&out).unwrap();
+    assert!(rf2.checksum_valid(), "checksum after profile repack");
+    // K single-bin chunks → K profile points read back.
+    assert_eq!(rf2.profile(1).expect("profile back").point_count(), k);
+    // The MS2 neighbor is intact.
+    let base = RawFile::open(sample("small2.RAW")).unwrap();
+    assert_eq!(base.centroid_peaks(2).len(), rf2.centroid_peaks(2).len());
+    assert!(rf2.scan_filter(1).is_some());
+}
+
 /// Repack to FEWER peaks (shrink) must also keep the file consistent.
 #[test]
 fn repack_shrink_roundtrip() {

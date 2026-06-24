@@ -1680,13 +1680,38 @@ impl RawFile {
         }
         debug_assert_eq!(o, new_len);
 
-        // Splice: replace the old packet with the new one. Everything physically after
-        // the old packet shifts by `delta` (can be negative when shrinking).
-        let delta: i64 = new_len as i64 - old_len as i64;
-        self.bytes.splice(pkt..pkt + old_len, p);
+        self.splice_packet_and_relocate(idx, pkt, old_len, p, tic, base_int, base_mz, low_mz, high_mz);
+        Ok(())
+    }
 
-        // Pre-splice boundary: any stored address at/after the end of the old packet
-        // refers to a byte that moved by `delta`.
+    /// Splice a freshly-built packet in place of scan `idx`'s old packet and relocate
+    /// every file region that physically follows it, so the section-address graph
+    /// stays consistent. Shared by [`repack_centroids`] and [`repack_profile`].
+    ///
+    /// Relocates: the controller directory, the MS run-header 64-bit section pointers
+    /// (scan_index / instlog / error_log / scantrailer / scanparams — data start is
+    /// fixed), and every scan-index entry's `Offset`/`Offset32`. Writes the grown
+    /// scan's `DataPacketSize` + summary stats. NOT relocated (Tier 1 TODO): run-header
+    /// 32-bit mirror addresses and any internal pointers inside method/log/tune streams.
+    #[allow(clippy::too_many_arguments)]
+    fn splice_packet_and_relocate(
+        &mut self,
+        idx: usize,
+        pkt: usize,
+        old_len: usize,
+        new_packet: Vec<u8>,
+        tic: f64,
+        base_int: f64,
+        base_mz: f64,
+        low_mz: f64,
+        high_mz: f64,
+    ) {
+        let new_len = new_packet.len();
+        let delta: i64 = new_len as i64 - old_len as i64;
+        self.bytes.splice(pkt..pkt + old_len, new_packet);
+
+        // Any stored address at/after the end of the old packet refers to a byte that
+        // moved by `delta` (delta is negative when shrinking).
         let boundary = (pkt + old_len) as u64;
         let bump = |a: u64| -> u64 {
             if a >= boundary {
@@ -1723,6 +1748,7 @@ impl RawFile {
         for j in (idx + 1)..self.index.len() {
             self.index[j].offset = (self.index[j].offset as i64 + delta) as u64;
         }
+        let entry = self.index[idx].clone();
         self.index[idx] = ScanIndexEntry {
             data_packet_size: new_len as u32,
             total_current: tic,
@@ -1750,6 +1776,161 @@ impl RawFile {
         put_f64(&mut self.bytes, ea + 48, base_mz);
         put_f64(&mut self.bytes, ea + 56, low_mz);
         put_f64(&mut self.bytes, ea + 64, high_mz);
+    }
+
+    /// Repack a scan's FTMS profile to a DIFFERENT number of peaks, growing or
+    /// shrinking the file as needed — the profile counterpart of [`repack_centroids`].
+    ///
+    /// Like [`author_profile`] it bins each `(m/z, intensity)` onto the scan's existing
+    /// frequency grid and writes one single-bin chunk per peak plus a coherent centroid
+    /// peaklist + descriptor list, but instead of failing when the rebuilt packet
+    /// exceeds the original budget it splices and relocates (see
+    /// [`splice_packet_and_relocate`]). The grid (first_value/step/nbins) and the m/z
+    /// calibration are preserved. Call [`save`] afterwards to fix the checksum.
+    pub fn repack_profile(
+        &mut self,
+        scan: u32,
+        peaks: &[(f64, f32)],
+        calib: &Calibration,
+    ) -> io::Result<()> {
+        if scan < self.first_scan || scan > self.last_scan {
+            return Err(err("scan out of range"));
+        }
+        if peaks.len() > u16::MAX as usize {
+            return Err(err("too many peaks (max 65535 per authored profile)"));
+        }
+        let idx = (scan - self.first_scan) as usize;
+        let entry = self.index[idx].clone();
+        let pkt = (self.data_addr + entry.offset) as usize;
+        let old_len = entry.data_packet_size as usize;
+        if pkt.checked_add(old_len).map_or(true, |e| e > self.bytes.len()) {
+            return Err(err("packet extends past end of file"));
+        }
+
+        let prof = self
+            .profile(scan)
+            .ok_or_else(|| err("scan has no FTMS profile to take the grid from"))?;
+        let layout = u32::from_le_bytes(self.bytes[pkt + 12..pkt + 16].try_into().unwrap());
+        let (first_value, step, nbins) = (prof.first_value, prof.step, prof.nbins);
+        if step == 0.0 || !step.is_finite() || !first_value.is_finite() {
+            return Err(err("profile grid is degenerate (step/first_value not finite)"));
+        }
+        let orig_profile_words =
+            u32::from_le_bytes(self.bytes[pkt + 4..pkt + 8].try_into().unwrap()) as usize;
+        let orig_peaklist_words =
+            u32::from_le_bytes(self.bytes[pkt + 8..pkt + 12].try_into().unwrap());
+        let pl_off = pkt + 40 + orig_profile_words * 4;
+        let centroid_wide = if orig_peaklist_words > 0 && pl_off + 4 <= self.bytes.len() {
+            let cnt = u32::from_le_bytes(self.bytes[pl_off..pl_off + 4].try_into().unwrap());
+            peak_is_wide(orig_peaklist_words, cnt)
+        } else {
+            true
+        };
+        let unknown1 = u32::from_le_bytes(self.bytes[pkt..pkt + 4].try_into().unwrap());
+
+        // Bin peaks onto the existing grid; merge collisions (same as author_profile).
+        let mut binned: Vec<(u32, f32)> = Vec::with_capacity(peaks.len());
+        for &(mz, inten) in peaks {
+            if !mz.is_finite() || mz <= 0.0 || !inten.is_finite() || inten < 0.0 {
+                return Err(err("profile peak must have finite m/z>0 and finite intensity>=0"));
+            }
+            let f = calib
+                .freq(mz)
+                .ok_or_else(|| err("peak m/z unreachable by this calibration"))?;
+            let bin = ((f - first_value) / step).round();
+            if !bin.is_finite() || bin < 0.0 || bin >= nbins as f64 {
+                return Err(err("peak m/z falls outside the scan's frequency grid"));
+            }
+            binned.push((bin as u32, inten));
+        }
+        binned.sort_by_key(|x| x.0);
+        let mut chunks: Vec<(u32, f32)> = Vec::with_capacity(binned.len());
+        for (bin, inten) in binned {
+            match chunks.last_mut() {
+                Some(last) if last.0 == bin => last.1 += inten,
+                _ => chunks.push((bin, inten)),
+            }
+        }
+
+        let k = chunks.len();
+        let chunk_bytes = if layout > 0 { 16usize } else { 12 };
+        let centroid_bytes = if centroid_wide { 12usize } else { 8 };
+        let profile_bytes = 16 + 8 + k * chunk_bytes;
+        let peaklist_bytes = 4 + k * centroid_bytes;
+        let descriptor_bytes = k * 4;
+        let new_len = 40 + profile_bytes + peaklist_bytes + descriptor_bytes;
+        let profile_words = u32::try_from(profile_bytes / 4).map_err(|_| err("profile too large"))?;
+        let peaklist_words =
+            u32::try_from(peaklist_bytes / 4).map_err(|_| err("peaklist too large"))?;
+        let k_u32 = k as u32;
+
+        // Stats.
+        let mut tic = 0f64;
+        let mut base_int = 0f64;
+        let mut base_mz = 0f64;
+        let mut low_mz = f64::INFINITY;
+        let mut high_mz = f64::NEG_INFINITY;
+        for &(bin, inten) in &chunks {
+            let mz = calib.mz(first_value + bin as f64 * step);
+            tic += inten as f64;
+            if inten as f64 > base_int {
+                base_int = inten as f64;
+                base_mz = mz;
+            }
+            low_mz = low_mz.min(mz);
+            high_mz = high_mz.max(mz);
+        }
+        if chunks.is_empty() {
+            low_mz = 0.0;
+            high_mz = 0.0;
+        }
+
+        // Build the replacement packet into a buffer (exact length), mirroring author_profile.
+        let mut p = vec![0u8; new_len];
+        put_u32(&mut p, 0, unknown1);
+        put_u32(&mut p, 4, profile_words);
+        put_u32(&mut p, 8, peaklist_words);
+        put_u32(&mut p, 12, layout);
+        put_u32(&mut p, 16, k_u32);
+        put_f32(&mut p, 32, low_mz as f32);
+        put_f32(&mut p, 36, high_mz as f32);
+        let mut o = 40;
+        put_f64(&mut p, o, first_value);
+        put_f64(&mut p, o + 8, step);
+        put_u32(&mut p, o + 16, k_u32);
+        put_u32(&mut p, o + 20, nbins);
+        o += 24;
+        for &(bin, inten) in &chunks {
+            put_u32(&mut p, o, bin);
+            put_u32(&mut p, o + 4, 1);
+            o += 8;
+            if layout > 0 {
+                put_f32(&mut p, o, 0.0);
+                o += 4;
+            }
+            put_f32(&mut p, o, inten);
+            o += 4;
+        }
+        put_u32(&mut p, o, k_u32);
+        o += 4;
+        for &(bin, inten) in &chunks {
+            let mz = calib.mz(first_value + bin as f64 * step);
+            if centroid_wide {
+                put_f64(&mut p, o, mz);
+                put_f32(&mut p, o + 8, inten);
+            } else {
+                put_f32(&mut p, o, mz as f32);
+                put_f32(&mut p, o + 4, inten);
+            }
+            o += centroid_bytes;
+        }
+        for i in 0..k {
+            p[o..o + 2].copy_from_slice(&(i as u16).to_le_bytes());
+            o += 4;
+        }
+        debug_assert_eq!(o, new_len);
+
+        self.splice_packet_and_relocate(idx, pkt, old_len, p, tic, base_int, base_mz, low_mz, high_mz);
         Ok(())
     }
 
