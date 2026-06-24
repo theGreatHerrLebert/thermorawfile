@@ -151,6 +151,51 @@ fn repack_profile_grow_roundtrip() {
     assert!(rf2.scan_filter(1).is_some());
 }
 
+/// DIRECT byte-preservation proof (single-controller fixture). The gap region
+/// (data_end..scan_index) holds the MS run header + instrument method + tune + logs,
+/// and the tail (scan-trailer..EOF) holds scan events + scan params. A repack
+/// RELOCATES both and bumps ONLY the run-header's 64-bit section pointers — the
+/// method/tune/log/event/param PAYLOAD must be byte-identical. We prove it by asserting
+/// the only bytes that differ in the gap fall inside the run-header section-pointer
+/// block, and the tail is fully identical. Independent of any reader's tolerance.
+#[test]
+fn repack_preserves_gap_section_payload() {
+    fn data_end(rf: &RawFile) -> usize {
+        rf.data_addr as usize
+            + (0..rf.index.len()).map(|j| rf.index[j].data_packet_size as usize).sum::<usize>()
+    }
+    let before = RawFile::open(sample("small2.RAW")).unwrap();
+    assert_eq!(before.controller_dir.len(), 1, "this byte-proof assumes one controller");
+    let de0 = data_end(&before);
+    // Run-header offset within the gap, and its relocatable 64-bit pointer block
+    // (scan_index @ +7408 .. scanparams @ +7456, each u64). Bytes here SHOULD change.
+    let rh_off = before.ms_runheader_addr as usize - de0;
+    let ptr_block = (rh_off + 7408)..(rh_off + 7456 + 8);
+    let tail_orig = before.bytes[before.scantrailer_addr as usize..].to_vec();
+
+    let mut rf = RawFile::open(sample("small2.RAW")).unwrap();
+    let grown: Vec<(f64, f32)> = (0..600).map(|i| (250.0 + i as f64 * 0.5, 700.0 + i as f32)).collect();
+    rf.repack_centroids(2, &grown).unwrap();
+
+    let g0 = &before.bytes[de0..before.scan_index_addr as usize];
+    let g1 = &rf.bytes[data_end(&rf)..rf.scan_index_addr as usize];
+    assert_eq!(g0.len(), g1.len(), "gap length changed (should only relocate)");
+    let mut changed_outside = 0;
+    for i in 0..g0.len() {
+        if g0[i] != g1[i] && !ptr_block.contains(&i) {
+            changed_outside += 1;
+        }
+    }
+    assert_eq!(
+        changed_outside, 0,
+        "gap payload (method/tune/log) bytes changed OUTSIDE the run-header pointer block"
+    );
+
+    // The scan-trailer/params tail is relocated but never rewritten → fully identical.
+    let tail_new = &rf.bytes[rf.scantrailer_addr as usize..];
+    assert!(tail_orig == tail_new, "scan-trailer/params BYTES changed after repack");
+}
+
 /// Batch repack of many scans in one rebuild must equal doing them one-by-one, and
 /// read back correctly.
 #[test]
