@@ -49,6 +49,71 @@ fn pure_rust_write_roundtrip() {
     assert!((orig3[0].mz - new3[0].mz).abs() < 1e-9);
 }
 
+/// Non-gated: scan_event_ranges decodes on the fixed-stride fixture, and
+/// rewindow_in_place skips MS1 + honors a `None` callback (re-windows only the one scan).
+#[test]
+fn scan_event_ranges_and_rewindow_on_fixture() {
+    let mut rf = RawFile::open(sample("small2.RAW")).unwrap();
+    let ms2 = (rf.first_scan..=rf.last_scan)
+        .find(|&s| rf.scan_event(s).is_some_and(|e| e.ms_order >= 2))
+        .expect("a MS2 scan in the fixture");
+    let ranges = rf.scan_event_ranges(ms2).expect("range block decodes on fixed-stride");
+    assert!(
+        !ranges.is_empty() && ranges.iter().all(|&(lo, hi)| lo > 0.0 && hi > lo),
+        "plausible fragment scan range, got {ranges:?}"
+    );
+
+    let mut closure_saw_ms1 = false;
+    let n = rf
+        .rewindow_in_place(|s, e| {
+            if e.ms_order == 1 {
+                closure_saw_ms1 = true; // must never fire — the loop filters MS1 out
+            }
+            (s == ms2).then_some((500.0, 3.0, 20.0)) // re-window only this scan; None elsewhere
+        })
+        .unwrap();
+    assert!(!closure_saw_ms1, "rewindow_in_place must skip MS1 (callback never sees one)");
+    assert_eq!(n, 1, "only the one scan re-windowed; None left the rest");
+    let ev = rf.scan_event(ms2).unwrap();
+    assert!((ev.isolation_center - 500.0).abs() < 1e-6 && (ev.isolation_width - 3.0).abs() < 1e-6);
+}
+
+/// Tier-2 3a: re-window all MS2 scans in place (here: halve every isolation width) and
+/// read the new windows back. Gate on a DIA template: `TIMSIM_VARLEN_DIA_TEMPLATE=<dia .raw>`.
+#[test]
+fn rewindow_in_place_roundtrip() {
+    let p = match std::env::var("TIMSIM_VARLEN_DIA_TEMPLATE") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("SKIP rewindow_in_place_roundtrip: set TIMSIM_VARLEN_DIA_TEMPLATE=<dia .raw>");
+            return;
+        }
+    };
+    let before = RawFile::open(&p).unwrap();
+    // Record the first MS2 scan's original window + a neighbor's.
+    let first_ms2 = (before.first_scan..=before.last_scan)
+        .find(|&s| before.scan_event(s).is_some_and(|e| e.ms_order >= 2))
+        .expect("a MS2 scan");
+    let orig = before.scan_event(first_ms2).unwrap();
+
+    let mut rf = RawFile::open(&p).unwrap();
+    // Halve each MS2 window's width; keep center + CE.
+    let n = rf
+        .rewindow_in_place(|_s, e| Some((e.isolation_center, e.isolation_width / 2.0, e.collision_energy)))
+        .unwrap();
+    assert!(n > 0, "expected MS2 scans to re-window");
+
+    let out = format!("{}/rewindowed.raw", env!("CARGO_TARGET_TMPDIR"));
+    rf.save(&out).unwrap();
+    let r = RawFile::open(&out).unwrap();
+    assert!(r.checksum_valid(), "checksum after re-window");
+    let now = r.scan_event(first_ms2).unwrap();
+    assert!((now.isolation_center - orig.isolation_center).abs() < 1e-6, "center preserved");
+    assert!((now.isolation_width - orig.isolation_width / 2.0).abs() < 1e-6, "width halved");
+    assert_eq!(r.scan_event_ranges(first_ms2), before.scan_event_ranges(first_ms2), "scan range unchanged");
+    eprintln!("rewindow OK: {n} MS2 re-windowed; width {} -> {}", orig.isolation_width, now.isolation_width);
+}
+
 /// Variable-length scan events (Orbitrap Fusion-class, no fixed stride) must decode to
 /// the correct per-scan ms-order + isolation windows. Gate on such a file:
 /// `TIMSIM_VARLEN_TEMPLATE=<fusion .raw>`.
