@@ -512,12 +512,17 @@ impl RawFile {
             controller_dir.push((off, addr));
         }
 
-        // The MS device is the run header whose scan-trailer address is non-zero.
+        // The MS device is the run header whose scan-trailer address is non-zero. A
+        // controller whose RunHeaderAddr is out of range is skipped (read_runheader →
+        // None) rather than panicking.
         let ms_pos = controller_dir
             .iter()
-            .position(|&(_, a)| read_runheader(&bytes, a as usize).scantrailer_addr != 0)
+            .position(|&(_, a)| {
+                read_runheader(&bytes, a as usize).is_some_and(|rh| rh.scantrailer_addr != 0)
+            })
             .ok_or_else(|| err("no MS run header found"))?;
-        let ms = read_runheader(&bytes, controller_dir[ms_pos].1 as usize);
+        let ms = read_runheader(&bytes, controller_dir[ms_pos].1 as usize)
+            .ok_or_else(|| err("MS run header address out of range"))?;
         let ms_runheader_addr = controller_dir[ms_pos].1;
 
         let n = (ms.last_scan - ms.first_scan + 1) as usize;
@@ -2326,8 +2331,15 @@ fn read_version(b: &[u8]) -> u32 {
     u32::from_le_bytes(b[36..40].try_into().unwrap())
 }
 
-/// Run-header parse for rev >= 64 (64-bit addresses).
-fn read_runheader(b: &[u8], addr: usize) -> MsRunHeader {
+/// Run-header parse for rev >= 64 (64-bit addresses). Returns `None` if `addr` (a
+/// controller-directory RunHeaderAddr) does not leave room for the whole fixed
+/// run-header span: a malformed or foreign-layout file can point it past EOF, and a
+/// raw slice panic here aborts the whole process across the PyO3 boundary. `None` lets
+/// the caller skip that controller and try the next.
+fn read_runheader(b: &[u8], addr: usize) -> Option<MsRunHeader> {
+    if addr.checked_add(RH_END).map_or(true, |end| end > b.len()) {
+        return None;
+    }
     // SampleInfo: FirstScanNumber @ +8, LastScanNumber @ +12.
     let first_scan = u32::from_le_bytes(b[addr + 8..addr + 12].try_into().unwrap());
     let last_scan = u32::from_le_bytes(b[addr + 12..addr + 16].try_into().unwrap());
@@ -2344,7 +2356,7 @@ fn read_runheader(b: &[u8], addr: usize) -> MsRunHeader {
     c.u64(); // Unknown9
     let scantrailer_addr = c.u64();
     let scanparams_addr = c.u64();
-    MsRunHeader {
+    Some(MsRunHeader {
         first_scan,
         last_scan,
         scan_index_addr,
@@ -2352,7 +2364,7 @@ fn read_runheader(b: &[u8], addr: usize) -> MsRunHeader {
         error_log_addr,
         scantrailer_addr,
         scanparams_addr,
-    }
+    })
 }
 
 /// Best-effort decode of the v64+ per-scan trailer-parameters stream: locate the schema
