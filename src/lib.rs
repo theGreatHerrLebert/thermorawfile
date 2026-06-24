@@ -1844,11 +1844,19 @@ impl RawFile {
         // loud rather than silently truncate a >4 GB offset.
         let esz = scan_index_entry_size(self.version);
         let six = self.scan_index_addr as usize;
+        // Decide Offset32 handling per FILE, not per entry: a populated-mirror file may
+        // legitimately have a zero in the first entry (offset 0), so a per-entry test
+        // would misread it as structural-zero. If ANY entry's Offset32 is non-zero, the
+        // file mirrors offsets and we rewrite them all; otherwise (rev>=64 norm) leave
+        // the field zero rather than fabricate one.
+        let populates_offset32 = (0..self.index.len()).any(|j| {
+            let ea = six + j * esz;
+            u32::from_le_bytes(self.bytes[ea..ea + 4].try_into().unwrap()) != 0
+        });
         for j in 0..self.index.len() {
             let ea = six + j * esz;
             let off = self.index[j].offset;
-            let cur32 = u32::from_le_bytes(self.bytes[ea..ea + 4].try_into().unwrap());
-            if cur32 != 0 {
+            if populates_offset32 {
                 let off32 = u32::try_from(off).map_err(|_| {
                     err("repack: scan offset exceeds the 32-bit Offset32 mirror (>4 GB data section unsupported)")
                 })?;
@@ -2515,25 +2523,56 @@ mod repack_index_convention_tests {
             (0..n * 3).map(|i| (250.0 + i as f64 * 0.5, 700.0 + i as f32)).collect();
         rf.repack_centroids(2, &grown).unwrap();
 
+        // Independent relocation check vs the ORIGINAL file: growing scan idx=2 by
+        // `delta` bytes must leave entries 0..=2 at their original offset and shift
+        // every later entry by exactly `delta` — proving the math, not just that disk
+        // agrees with the in-memory model.
+        let idx = (2 - before.first_scan) as usize; // scan number 2 -> index slot
+        let delta = rf.index[idx].data_packet_size as i64 - before.index[idx].data_packet_size as i64;
+        assert!(delta > 0, "test expects a grow (delta={delta})");
         let six = rf.scan_index_addr as usize;
         for j in 0..rf.index.len() {
+            let want = if j <= idx {
+                before.index[j].offset
+            } else {
+                (before.index[j].offset as i64 + delta) as u64
+            };
+            assert_eq!(rf.index[j].offset, want, "entry {j} offset relocation wrong");
             let ea = six + j * esz;
-            // Offset32 stays zero (convention preserved, no fabricated value).
             assert_eq!(
                 u32::from_le_bytes(rf.bytes[ea..ea + 4].try_into().unwrap()),
                 0,
                 "Offset32 must stay zero after repack (entry {j})"
             );
-            // The 64-bit Offset on disk matches the in-memory model.
-            let on_disk = u64::from_le_bytes(rf.bytes[ea + 72..ea + 80].try_into().unwrap());
-            assert_eq!(on_disk, rf.index[j].offset, "Offset(+72) mismatch (entry {j})");
-        }
-        // Offsets are still strictly increasing (packets remain contiguous, in order).
-        for j in 1..rf.index.len() {
-            assert!(
-                rf.index[j].offset > rf.index[j - 1].offset,
-                "offsets not monotonic at {j}"
+            assert_eq!(
+                u64::from_le_bytes(rf.bytes[ea + 72..ea + 80].try_into().unwrap()),
+                rf.index[j].offset,
+                "Offset(+72) on disk mismatch (entry {j})"
             );
+        }
+    }
+
+    // Guardrail for the format assumption: none of the 10 u32 slots preceding the
+    // run-header 64-bit pointers is a live address mirror (low-32 of a section pointer)
+    // on the supported rev>=64 fixtures — so leaving them untouched on repack is safe.
+    #[test]
+    fn runheader_addr32_slots_are_not_live_mirrors() {
+        for path in [format!("{}/tests/data/small2.RAW", env!("CARGO_MANIFEST_DIR"))] {
+            let rf = RawFile::open(&path).unwrap();
+            let rh = rf.ms_runheader_addr as usize;
+            let section_low32: Vec<u32> = super::RH_SECTION_PTRS
+                .iter()
+                .map(|&o| u64::from_le_bytes(rf.bytes[rh + o..rh + o + 8].try_into().unwrap()) as u32)
+                .filter(|&v| v != 0)
+                .collect();
+            for slot in 0..10 {
+                let mo = rh + 7368 + slot * 4;
+                let v = u32::from_le_bytes(rf.bytes[mo..mo + 4].try_into().unwrap());
+                assert!(
+                    v == 0 || !section_low32.contains(&v),
+                    "{path}: Addr32 slot {slot} ({v:#x}) looks like a live section mirror"
+                );
+            }
         }
     }
 }
