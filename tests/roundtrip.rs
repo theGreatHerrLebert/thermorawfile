@@ -49,6 +49,27 @@ fn pure_rust_write_roundtrip() {
     assert!((orig3[0].mz - new3[0].mz).abs() < 1e-9);
 }
 
+/// A controller-directory RunHeaderAddr pointing past EOF (malformed or foreign-layout
+/// file) must produce a graceful Err — NOT a slice panic, which would abort the whole
+/// process when called across the PyO3 boundary.
+#[test]
+fn open_errs_not_panics_on_out_of_range_runheader_addr() {
+    let mut bytes = std::fs::read(sample("small2.RAW")).unwrap();
+    assert!(RawFile::from_bytes(bytes.clone()).is_ok(), "fixture opens clean as-is");
+    // The single controller's RunHeaderAddr (u64) for this fixture sits at offset 2432.
+    let off = 2432usize;
+    assert_eq!(
+        u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()),
+        2_071_234,
+        "fixture RunHeaderAddr offset moved; update the test"
+    );
+    bytes[off..off + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(
+        RawFile::from_bytes(bytes).is_err(),
+        "out-of-range RunHeaderAddr must error gracefully, not panic"
+    );
+}
+
 #[test]
 fn rejects_count_mismatch() {
     let mut rf = RawFile::open(sample("small2.RAW")).unwrap();
