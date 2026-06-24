@@ -210,6 +210,45 @@ fn repack_many_grows_multiple_scans() {
     );
 }
 
+/// Batch repack must handle an UNORDERED edit list mixing grow and shrink.
+#[test]
+fn repack_many_unordered_with_shrink() {
+    use thermorawfile::ScanEdit;
+    let base = RawFile::open(sample("small2.RAW")).unwrap();
+    let c: Vec<u32> = (base.first_scan..=base.last_scan)
+        .filter(|&s| !base.centroid_peaks(s).is_empty())
+        .take(4)
+        .collect();
+    // Edits NOT in scan order; mix grows and shrinks.
+    let payloads: Vec<(u32, Vec<(f64, f32)>)> = vec![
+        (c[3], (0..2000).map(|i| (200.0 + i as f64 * 0.1, 10.0 + i as f32)).collect()),
+        (c[1], (0..5).map(|i| (300.0 + i as f64, 10.0 + i as f32)).collect()),
+        (c[0], (0..1500).map(|i| (250.0 + i as f64 * 0.1, 5.0 + i as f32)).collect()),
+        (c[2], (0..3).map(|i| (400.0 + i as f64, 9.0 + i as f32)).collect()),
+    ];
+    let edits: Vec<ScanEdit> = payloads
+        .iter()
+        .map(|(s, p)| ScanEdit::Centroids { scan: *s, peaks: p })
+        .collect();
+
+    let mut rf = RawFile::open(sample("small2.RAW")).unwrap();
+    rf.repack_many(&edits).unwrap();
+    let out = format!("{}/repack_unord.raw", env!("CARGO_TARGET_TMPDIR"));
+    rf.save(&out).unwrap();
+    let r = RawFile::open(&out).unwrap();
+    assert!(r.checksum_valid());
+    for (s, p) in &payloads {
+        assert_eq!(r.centroid_peaks(*s).len(), p.len(), "scan {s} count");
+    }
+    // The remaining scans are untouched.
+    for s in base.first_scan..=base.last_scan {
+        if payloads.iter().any(|(t, _)| t == &s) {
+            continue;
+        }
+        assert_eq!(base.centroid_peaks(s).len(), r.centroid_peaks(s).len(), "untouched {s}");
+    }
+}
+
 /// Repack to FEWER peaks (shrink) must also keep the file consistent.
 #[test]
 fn repack_shrink_roundtrip() {

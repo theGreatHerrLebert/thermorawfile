@@ -1690,6 +1690,11 @@ impl RawFile {
         if pkt.checked_add(old_len).map_or(true, |e| e > self.bytes.len()) {
             return Err(err("packet extends past end of file"));
         }
+        if old_len < 40 {
+            // The 40-byte packet header is read at fixed offsets below; a corrupt
+            // DataPacketSize smaller than that would read into the next packet.
+            return Err(err("packet too short to be a valid scan packet"));
+        }
 
         // Native centroid record width from the existing packet (mirrors author_centroids).
         let unknown1 = u32::from_le_bytes(self.bytes[pkt..pkt + 4].try_into().unwrap());
@@ -2045,6 +2050,11 @@ impl RawFile {
         let old_len = entry.data_packet_size as usize;
         if pkt.checked_add(old_len).map_or(true, |e| e > self.bytes.len()) {
             return Err(err("packet extends past end of file"));
+        }
+        if old_len < 40 {
+            // The 40-byte packet header is read at fixed offsets below; a corrupt
+            // DataPacketSize smaller than that would read into the next packet.
+            return Err(err("packet too short to be a valid scan packet"));
         }
 
         let prof = self
