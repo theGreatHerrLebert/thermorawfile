@@ -6,3 +6,9 @@ __pycache__/
 *.so
 .venv/
 *.egg-info/
+
+# local design/review docs — keep out of the repo
+*.codex.md
+*.codex-review.md
+REPACK_GAP_VALIDATION.md
+PLAN_*.md
