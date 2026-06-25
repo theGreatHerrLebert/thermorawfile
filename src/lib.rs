@@ -1263,7 +1263,7 @@ impl RawFile {
             .profile(scan)
             .ok_or_else(|| err("scan has no FTMS profile"))?;
         let (first_value, step, nbins) = (prof.first_value, prof.step, prof.nbins);
-        if step == 0.0 || !step.is_finite() || !first_value.is_finite() {
+        if step == 0.0 || !step.is_finite() || !first_value.is_finite() || nbins == 0 {
             return Err(err("profile grid is degenerate"));
         }
         let layout = u32::from_le_bytes(self.bytes[pkt + 12..pkt + 16].try_into().unwrap());
@@ -1291,6 +1291,66 @@ impl RawFile {
                 *acc.entry(ch.first_bin + j as u32).or_insert(0.0) += v as f64;
             }
         }
+        // Empirical peak width for THIS scan: median FWHM (in frequency bins) of the real profile
+        // peaks. Orbitrap profile peaks span several bins (the FT transient has finite width);
+        // depositing a simulated fragment into a single nearest bin produces a delta-spike that is
+        // not physically faithful. Instead spread each fragment as an area-conserving Gaussian whose
+        // width is calibrated to the template's own real peaks, so injected peaks match this
+        // acquisition's resolution/apodization. Falls back to a small default if the scan has too
+        // few resolvable real peaks.
+        let sim_sigma_bins = {
+            let mut fwhms: Vec<f64> = Vec::new();
+            for ch in &prof.chunks {
+                let s = &ch.signal;
+                if s.len() < 5 {
+                    continue; // too short to host a fully-resolved peak
+                }
+                let (imax, vmax) = s.iter().enumerate().fold(
+                    (0usize, 0f32),
+                    |(bi, bv), (i, &v)| if v > bv { (i, v) } else { (bi, bv) },
+                );
+                // Apex must be interior so both half-height crossings can fall inside the chunk;
+                // an apex on a chunk edge means we caught only part of the peak (or a merge).
+                if vmax <= 0.0 || imax == 0 || imax + 1 >= s.len() {
+                    continue;
+                }
+                let half = vmax as f64 * 0.5;
+                let mut l = imax;
+                while l > 0 && (s[l - 1] as f64) > half {
+                    l -= 1;
+                }
+                let mut r = imax;
+                while r + 1 < s.len() && (s[r + 1] as f64) > half {
+                    r += 1;
+                }
+                // Require both half-height crossings strictly inside the chunk (a complete, isolated
+                // peak); else skip — this filters merged/clipped peaks from the width estimate.
+                if l == 0 || r + 1 >= s.len() {
+                    continue;
+                }
+                // Linear-interpolate the half-height crossings for a sub-bin FWHM (the integer bin
+                // count alone is biased low by up to ~1 bin).
+                let (sl, slm) = (s[l] as f64, s[l - 1] as f64);
+                let (sr, srp) = (s[r] as f64, s[r + 1] as f64);
+                if sl <= slm || sr <= srp {
+                    continue;
+                }
+                let xl = (l - 1) as f64 + (half - slm) / (sl - slm);
+                let xr = r as f64 + (sr - half) / (sr - srp);
+                let fwhm = xr - xl;
+                if fwhm.is_finite() && fwhm >= 1.0 {
+                    fwhms.push(fwhm);
+                }
+            }
+            let sigma = if fwhms.is_empty() {
+                2.0 // default sigma (~4.7-bin FWHM) when no real peak width is resolvable
+            } else {
+                fwhms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                fwhms[fwhms.len() / 2] / 2.354_820_045 // median FWHM -> Gaussian sigma
+            };
+            sigma.max(1.5) // floor (~3.5-bin FWHM) so a failed-low estimate can't re-spike
+        };
+
         for &(mz, inten) in sim_peaks {
             if !inten.is_finite() || inten < 0.0 {
                 return Err(err("sim peak intensity must be finite and non-negative"));
@@ -1298,11 +1358,30 @@ impl RawFile {
             let f = calib
                 .freq(mz)
                 .ok_or_else(|| err("sim peak m/z unreachable by this calibration"))?;
-            let b = ((f - first_value) / step).round();
-            if !b.is_finite() || b < 0.0 || b >= nbins as f64 {
+            // Exact (unrounded) bin centre, so the peak sits where the m/z actually maps instead of
+            // snapping to a grid node (snapping also quantises the apparent m/z).
+            let bc = (f - first_value) / step;
+            if !bc.is_finite() || bc < 0.0 || bc >= nbins as f64 {
                 return Err(err("sim peak m/z falls outside the scan's frequency grid"));
             }
-            *acc.entry(b as u32).or_insert(0.0) += inten as f64;
+            // Area-conserving Gaussian deposit over +/-4 sigma. Two passes (sum the weights, then
+            // deposit normalised) so the per-bin weights sum to 1 and total intensity == `inten`,
+            // even where the kernel is clipped at a grid edge.
+            let lo = (bc - 4.0 * sim_sigma_bins).floor().max(0.0) as u32;
+            let hi = (bc + 4.0 * sim_sigma_bins).ceil().min((nbins - 1) as f64) as u32;
+            let mut wsum = 0.0f64;
+            for b in lo..=hi {
+                let z = (b as f64 - bc) / sim_sigma_bins;
+                wsum += (-0.5 * z * z).exp();
+            }
+            if !(wsum > 0.0) {
+                return Err(err("degenerate peak-shape kernel"));
+            }
+            for b in lo..=hi {
+                let z = (b as f64 - bc) / sim_sigma_bins;
+                let w = (-0.5 * z * z).exp() / wsum;
+                *acc.entry(b).or_insert(0.0) += inten as f64 * w;
+            }
         }
 
         // Build contiguous chunks; convert accumulated f64 → f32 (the stored
